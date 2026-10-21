@@ -1,0 +1,4 @@
+/target
+*.wav
+__pycache__/
+*.lnk

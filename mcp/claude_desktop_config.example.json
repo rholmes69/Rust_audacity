@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rust-audacity": {
+      "command": "C:\\Users\\sales\\Rust-Audacity\\target\\release\\rust_audacity_mcp.exe",
+      "args": ["--root", "C:\\Users\\sales\\Music"]
+    }
+  }
+}
