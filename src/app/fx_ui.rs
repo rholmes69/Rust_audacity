@@ -366,18 +366,7 @@ impl AudacityApp {
         }
         if let Some(chain) = apply {
             self.stop_preview();
-            if !self.busy() {
-                self.engine.stop_playback();
-                match effects::apply_chain(&mut self.project, &chain.name, &chain.steps) {
-                    Ok(()) => self.status = format!("Applied chain “{}”", chain.name),
-                    Err(e) => {
-                        self.dialog = Some(Dialog::Message(format!(
-                            "Chain “{}” failed.\n{e}",
-                            chain.name
-                        )))
-                    }
-                }
-            }
+            self.start_effect_job(format!("Chain “{}”", chain.name), chain.steps.clone());
         }
         if !open {
             self.stop_preview();

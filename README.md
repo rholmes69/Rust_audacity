@@ -5,7 +5,8 @@
 An Audacity-style audio editor written in Rust. It uses
 [egui/eframe](https://github.com/emilk/egui) for the UI, [cpal](https://github.com/RustAudio/cpal) for audio I/O,
 [Symphonia](https://github.com/pdeljanov/Symphonia) for decoding, [hound](https://github.com/ruuda/hound) for WAV writing,
-[realfft](https://github.com/HEnquist/realfft) for FFTs and [ebur128](https://github.com/sdroege/ebur128) for loudness.
+[flacenc](https://github.com/yotarok/flacenc-rs), [LAME](https://lame.sourceforge.io) and [libvorbis/aoTuV](https://github.com/ComunidadAylas/vorbis-rs)
+for FLAC/MP3/Ogg export, [realfft](https://github.com/HEnquist/realfft) for FFTs and [ebur128](https://github.com/sdroege/ebur128) for loudness.
 
 ## Build & run (Windows)
 
@@ -21,14 +22,30 @@ An Audacity-style audio editor written in Rust. It uses
 
    To get a desktop shortcut with the app icon, double-click **`Create Desktop Shortcut.bat`**. It builds the app first if needed.
 
-On Linux you also need `libasound2-dev`, `libgtk-3-dev` and `libxkbcommon-dev`.
+The MP3 and Ogg encoders are C libraries that Cargo compiles for you, so the first build takes a little longer.
+The Visual Studio C++ build tools that come with the MSVC Rust toolchain are all you need.
+
+On Linux you also need `libasound2-dev`, `libgtk-3-dev`, `libxkbcommon-dev` and `autoconf`/`make` (for LAME).
 
 ## Features
 
 ### Core editor
 
+- **Projects:** File ▸ Save Project (Ctrl+S) / Open Project (Ctrl+O) saves everything in one `.rap` file: every track's audio (lossless 32-bit float), names, gain, pan, mute/solo, the selection and the zoom. Saving is crash-safe (it writes a temporary file, then swaps it in). You're asked to save before New, Open or closing with unsaved changes. Undo history isn't saved. Double-click or drop a `.rap` file to open it.
 - **Import:** WAV, MP3, FLAC, OGG, M4A/AAC, AIFF and more. Use drag & drop or File ▸ Import.
-- **Export:** WAV as 16-bit PCM (dithered), 24-bit PCM or 32-bit float.
+- **Export (File ▸ Export Audio, Ctrl+Shift+E):**
+  - WAV: 16-bit PCM (dithered), 24-bit PCM or 32-bit float.
+  - FLAC: 16- or 24-bit, lossless.
+  - MP3: 64–320 kbps constant bitrate.
+  - Ogg Vorbis: quality 0–10.
+
+  Export runs in the background and remembers your last format.
+- **Effects run in the background.** A progress window with **Cancel** appears for anything that takes more than a moment, and the window stays responsive.
+- **Time Shift tool (F5, ↔ button):**
+  - Drag a track left or right to move it in time. It never cuts audio: moving left only removes leading silence.
+  - Select some audio first, then drag inside the selection to move just that part. Drop it on another track to move it there.
+
+  Each move is one undo step. F1 switches back to the Selection tool.
 - **Playback:** play, pause, stop, loop, and click the timeline to play from that point.
 - **Recording:** records from the microphone, with overdub.
 - **Editing:** cut, copy, paste, delete, silence, trim, duplicate and split, with 100-step undo.
@@ -104,9 +121,39 @@ Use **Stems ▸ Separate Stems…** and pick an engine:
 
 To change a built-in chain, click **Duplicate to edit**. You can reorder steps, change each step's settings and add steps. Your own chains are saved automatically.
 
+### Transcription and text-based editing (Whisper)
+
+**Analyze ▸ Transcribe Speech (Whisper)…** turns the selected track's speech into text with a time for every word. It uses OpenAI's open-source Whisper model running on your own PC. Nothing is uploaded.
+
+**One-time setup:** install Python 3 from python.org, then run
+
+```powershell
+pip install -U faster-whisper
+```
+
+The model you pick downloads the first time you use it. Sizes run from `tiny` (75 MB, rough) to `large-v3` (3 GB, best); `small` is a good default. An NVIDIA GPU is used automatically when available. On a CPU, `small` takes roughly as long as the audio.
+
+The **transcript panel** (View ▸ Transcript Panel, Ctrl+Shift+T) shows the text:
+
+- **Select by text.** Click a word to select its audio, Shift+click to select a range of words, and double-click to play from a word. The current word lights up during playback.
+- **Cut by text.** **✂ Delete words** cuts the selected words out of the audio. By default every track is cut, so music or a second microphone stays in sync; untick "Cuts apply to all tracks" to cut only the voice.
+- **Remove fillers** cuts every "um", "uh", "erm" and similar word in one step.
+- **Find words** highlights matches. Uncertain words are underlined and fillers are shown in orange.
+- **Export ▸** saves subtitles (.srt) or plain text (.txt), or copies the text.
+
+Words also appear along the bottom of the track's waveform. The transcript stays lined up through edits: cutting, pasting, trimming, time-shifting and tempo changes all move the words with the audio. It is part of undo and is saved in `.rap` projects.
+
+### Let an AI agent edit with you (Agents menu)
+
+While the app is open, AI agents connected through the Rust Audacity MCP server can work in this window using the `app_*` tools. They can open files, select, edit, apply effects, play, transcribe and cut words, export and save, and you watch it happen. Every change is a normal undo step.
+
+- **Turning it off:** Agents ▸ "Allow AI agents to control this window" (on by default).
+- **Status bar:** shows 🤖 while an agent is working.
+- **Security:** the app only listens on your own computer (127.0.0.1) and uses a secret token stored in your temp folder, so only programs running as you can connect.
+
 ## Use it from AI agents (MCP server)
 
-`rust_audacity_mcp` is a second program built from the same engine. It lets AI agents such as Claude Desktop, Claude Code and Cursor analyze, clean up, edit, convert, mix and stem-separate audio files.
+`rust_audacity_mcp` is a second program built from the same engine. It lets AI agents such as Claude Desktop, Claude Code and Cursor analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. It also lets them drive the open Rust Audacity window through the `app_*` tools.
 
 ```powershell
 cargo build --release --bin rust_audacity_mcp
@@ -125,20 +172,32 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 | Ctrl+X / C / V, Delete | Cut / Copy / Paste, Delete |
 | Ctrl+L / T / D / A | Silence / Trim / Duplicate / Select all |
 | Ctrl+1 / Ctrl+3 / Ctrl+E / Ctrl+F | Zoom in / out / to selection / fit |
-| Ctrl+Shift+I / Ctrl+Shift+E | Import / Export |
+| Ctrl+N / Ctrl+O | New project / Open project |
+| Ctrl+S / Ctrl+Shift+S | Save project / Save As |
+| Ctrl+Shift+I / Ctrl+Shift+E | Import audio / Export audio |
+| F1 / F5 | Selection tool / Time Shift tool |
+| Ctrl+Shift+T | Show / hide the transcript panel |
 
 ## Code layout
 
 ```
 src/
   lib.rs             audio engine library shared by the app and the MCP server
-  bin/rust_audacity_mcp/  MCP server (main.rs = protocol, tools.rs = tools)
+  bin/rust_audacity_mcp/  MCP server (main.rs = protocol, tools.rs = file tools, app_tools.rs = app_* tools)
   bin/rust_audacity_chat.rs  terminal chat that connects an Ollama model to the MCP server
   main.rs            window setup
   app.rs             main UI: menus, transport, tracks, waveform/spectrogram, dialogs
   app/fx_ui.rs       effect dialogs with Preview, Effect Chains editor
   app/analyze_ui.rs  spectrum plot and loudness statistics window
   app/stems_ui.rs    stem separation dialog and background job
+  app/jobs_ui.rs     background effect/export jobs with progress and Cancel
+  app/file_ui.rs     project Open/Save, "save changes?" prompt, export dialog
+  app/transcript_ui.rs  Transcribe dialog, transcript panel, text-based editing
+  app/bridge_ui.rs   runs agent commands in the window
+  projectfile.rs     .rap project file format (save/load)
+  transcript.rs      word timings that follow edits, fillers, SRT/TXT
+  whisper.rs         runs Whisper (whisper_runner.py) and parses its output
+  bridge.rs          localhost agent bridge (server in the app, client in the MCP server)
   effects.rs         effect catalogue (serialisable), render/apply/preview/chains
   ui_effects.rs      parameter editors for every effect
   spectrogram.rs     spectrogram rendering and texture cache
@@ -153,13 +212,22 @@ src/
     space.rs         reverb, stereo width, vocal remover
     analysis.rs      LUFS/LRA/true-peak, spectrum
     separation.rs    built-in centre extraction, Demucs runner
-  project.rs, track.rs, engine.rs, fileio.rs, waveform.rs
+  project.rs         tracks, selection, undo, edits, time shift
+  fileio.rs          import (Symphonia) and WAV/FLAC/MP3/Ogg export
+  track.rs, engine.rs, waveform.rs
 ```
 
-Run `cargo test` to run the 48 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, and the Demucs command is checked with a stand-in script.
+Run `cargo test` to run the 64 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), and the agent bridge round-trips and rejects wrong tokens.
 
 ## Known limitations
 
-- Effects run on the UI thread, so heavy effects (tempo/pitch, noise reduction) on long files pause the window for a moment. Stem separation runs in the background.
+- Each track is one continuous clip, so a moved region overwrites what is at the destination rather than creating separate overlapping clips.
+- Progress for a single effect on a single track shows as "working…" rather than a percentage. Cancel takes effect immediately in the window; the worker finishes its current step in the background and the result is thrown away.
 - Resampling uses linear interpolation.
-- Not built yet: project save/load, MP3/FLAC export, clip dragging, labels and envelopes, and choosing audio devices.
+- Whisper word times are accurate to roughly a tenth of a second. Cutting a word can occasionally clip the start of the next one; undo and select a little less if so.
+- Transcription covers one track at a time.
+- Not built yet: envelopes, editable labels, choosing audio devices, and metadata tags on export.
+
+## Licences of bundled encoders
+
+MP3 export uses LAME, which is LGPL. It is compiled into the program. That's fine for personal use; if you distribute the program, read the LGPL's terms for static linking. The FLAC encoder (flacenc) is Apache-2.0, and libvorbis/libogg are BSD.

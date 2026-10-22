@@ -48,6 +48,7 @@ Use the same command and args in the client's MCP settings. The transport is **s
 |---|---|
 | `--root <folder>` | Only allow files inside this folder. Relative paths are resolved against it. |
 | `--demucs-command "<cmd>"` | How to run Demucs for AI stem separation. Default `python -m demucs` on Windows, `demucs` elsewhere. |
+| `--python <python>` | The Python that has `faster-whisper` installed, for `transcribe_audio`. Default `python` on Windows, `python3` elsewhere. |
 
 ## Tools
 
@@ -58,13 +59,42 @@ Use the same command and args in the client's MCP settings. The transport is **s
 | `list_effects` | All 27 effects with ids, categories, descriptions and default parameters, plus the built-in chains. |
 | `apply_effects` | Apply a list of effects and/or a built-in chain (e.g. `"Podcast Voice"`) to a whole file or a time range, then write a new WAV. Reports loudness before and after. `noise_reduction` takes its profile from `noise_profile` or from the quietest 0.5 s automatically. |
 | `edit_audio` | Operations: trim, delete, silence, insert_silence, fade_in, fade_out, gain, reverse, remove_silence (shortens long pauses). |
-| `convert_audio` | Any format to WAV, with optional new sample rate, mono/stereo, bit depth and LUFS normalization. |
+| `convert_audio` | Any format to WAV, FLAC, MP3 or Ogg Vorbis, with optional new sample rate, mono/stereo, bit depth and LUFS normalization. |
 | `mix_audio` | Mix several files with per-input gain, pan, offset and mute, e.g. recombine stems or put music under a voice. |
 | `generate_audio` | Tone (sine/square/saw/triangle), noise (white/pink/brown) or silence. |
 | `separate_stems` | Split a song into stems as WAV files. `engine: "demucs"` gives 4 stems (vocals/drums/bass/other), 6 stems with `htdemucs_6s`, or 2 stems with `two_stems`; it needs `pip install -U demucs`, reports progress and can be cancelled. `engine: "builtin"` gives an instant vocals + instrumental split with nothing to install. |
 | `render_spectrogram` | Saves a PNG spectrogram and returns it as an image the agent can look at. |
+| `transcribe_audio` | Speech-to-text with Whisper. Returns text plus `[start, end, word]` timings, and can write `.srt`, `.txt` or `.json`. Needs `pip install -U faster-whisper`. |
+
+### Tools for the open app window
+
+These tools need the Rust Audacity app to be running (Agents ▸ "Allow AI agents to control this window" must be on). The agent works in the window you're looking at, and everything it does can be undone with Ctrl+Z.
+
+| Tool | What it does |
+|---|---|
+| `app_status` | Tracks, selection, running job, undo history, transcript info; `measure: true` adds loudness. |
+| `app_open` | Import an audio file as a new track, or open a `.rap` project. Waits for the import to finish. |
+| `app_select` | Set the time selection (seconds) and which tracks are selected; optional zoom. |
+| `app_edit` | cut, copy, paste, delete, silence, trim, duplicate, split_new, mix_and_render, select_all, remove_selected_tracks, undo, redo. |
+| `app_apply_effects` | Effects and/or a chain on the selection as one undo step. Waits, then reports loudness. |
+| `app_track` | Name, gain, pan, mute, solo, selected. |
+| `app_playback` | Play (from/to) or stop, through your speakers. |
+| `app_export` | Export the mix or the selection; the format comes from the extension. |
+| `app_save_project` | Save as `.rap`. |
+| `app_transcript` | `transcribe` (Whisper), `get` (words with indices and times), `delete_words` (cut words by index), `remove_fillers`, `show`. |
 
 Inputs are never modified: results go to a new file (default `<name>_processed.wav` and similar). Writing over the input requires `overwrite: true`.
+
+**Output formats:** every tool that writes audio picks the format from the output file's extension:
+
+| Extension | Format | Options |
+|---|---|---|
+| `.wav` | WAV | `format`: `pcm16`, `pcm24` (default) or `float32` |
+| `.flac` | FLAC, lossless | `format`: `pcm16` gives 16-bit, anything else 24-bit |
+| `.mp3` | MP3, constant bitrate | `mp3_kbps`: 64–320 (default 192) |
+| `.ogg` | Ogg Vorbis | `ogg_quality`: 0–10 (default 6) |
+
+`separate_stems` takes `file_type` (`wav`, `flac`, `mp3` or `ogg`).
 Every result contains a readable summary plus machine-readable `structuredContent`.
 
 ### Example `apply_effects` call
@@ -163,6 +193,9 @@ The bridge was tested this way end to end: analyze → apply suggested effects �
 - "Shorten all the long pauses in `lecture.wav` and normalize it to −16 LUFS."
 - "Show me the spectrogram of the first 10 seconds of `noisy.wav`. Is there hum?"
 - "Make `track.flac` 48 kHz, 16-bit and −14 LUFS for streaming."
+- "Convert every WAV in this folder to 320 kbps MP3."
+- With the app open: "Transcribe the interview I have open, cut the off-topic part about the weather and all the ums, then make it −16 LUFS and export interview.mp3."
+- "Make subtitles for talk.mp4's audio" (`transcribe_audio` with `output: "talk.srt"`).
 
 ## Protocol details
 
@@ -170,6 +203,7 @@ The bridge was tested this way end to end: analyze → apply suggested effects �
 - Protocol versions 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05 are negotiated.
 - Implements `initialize`, `ping`, `tools/list`, `tools/call`, `notifications/progress` (when the client sends a `progressToken`) and `notifications/cancelled` (stops a running Demucs job). `resources/list` and `prompts/list` return empty lists.
 - Each tool call runs on its own thread, so a long stem separation doesn't block other calls.
+- The `app_*` tools reach the app over the agent bridge: a localhost TCP socket (`127.0.0.1`, random port) that takes one JSON request per line and needs a secret token. The app writes the port and token to `rust_audacity_bridge.json` in your temp folder while it runs.
 
 ## Testing
 

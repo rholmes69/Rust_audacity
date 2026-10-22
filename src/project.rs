@@ -1,9 +1,16 @@
 //! Project state: tracks, selection, clipboard and undo history.
 
-use crate::track::{Track, resample};
+use std::sync::Arc;
+
+use crate::{
+    track::{Track, resample},
+    transcript::Transcript,
+};
 
 pub const DEFAULT_RATE: u32 = 44_100;
 const MAX_UNDO: usize = 100;
+/// Samples quieter than this count as silence when time-shifting.
+const SILENCE: f32 = 1e-5;
 
 /// A time selection, in samples at the project rate. `start == end` means a cursor.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -37,6 +44,7 @@ impl Selection {
 struct Snapshot {
     tracks: Vec<Track>,
     selection: Selection,
+    transcript: Option<Arc<Transcript>>,
     label: String,
 }
 
@@ -60,6 +68,8 @@ pub struct Project {
     pub dirty: bool,
     /// Noise fingerprint captured for Noise Reduction (not part of undo history).
     pub noise_profile: Option<crate::dsp::denoise::NoiseProfile>,
+    /// Word-level transcript of one track (part of undo history).
+    pub transcript: Option<Arc<Transcript>>,
 }
 
 impl Default for Project {
@@ -75,6 +85,7 @@ impl Default for Project {
             revision: 0,
             dirty: false,
             noise_profile: None,
+            transcript: None,
         }
     }
 }
@@ -102,6 +113,7 @@ impl Project {
         self.undo.push(Snapshot {
             tracks: self.tracks.clone(),
             selection: self.selection,
+            transcript: self.transcript.clone(),
             label: label.into(),
         });
         if self.undo.len() > MAX_UNDO {
@@ -136,6 +148,7 @@ impl Project {
         let current = Snapshot {
             tracks: std::mem::replace(&mut self.tracks, snap.tracks),
             selection: self.selection,
+            transcript: std::mem::replace(&mut self.transcript, snap.transcript),
             label: snap.label,
         };
         self.selection = snap.selection;
@@ -156,11 +169,71 @@ impl Project {
         let current = Snapshot {
             tracks: std::mem::replace(&mut self.tracks, snap.tracks),
             selection: self.selection,
+            transcript: std::mem::replace(&mut self.transcript, snap.transcript),
             label: snap.label,
         };
         self.selection = snap.selection;
         self.undo.push(current);
         self.touch();
+        true
+    }
+
+    // ----- transcript ----------------------------------------------------------
+
+    /// Index of the track the transcript belongs to (if it still exists).
+    pub fn transcript_track(&self) -> Option<usize> {
+        let id = self.transcript.as_ref()?.track_id;
+        self.tracks.iter().position(|t| t.id == id)
+    }
+
+    /// Mutable transcript, if it belongs to track `idx`.
+    fn transcript_for(&mut self, idx: usize) -> Option<&mut Transcript> {
+        let id = self.tracks.get(idx)?.id;
+        let t = self.transcript.as_mut()?;
+        if t.track_id != id {
+            return None;
+        }
+        Some(Arc::make_mut(t))
+    }
+
+    /// Track `idx` had `[start, old_end)` replaced by `[start, new_end)`.
+    pub fn retime_transcript(&mut self, idx: usize, start: usize, old_end: usize, new_end: usize) {
+        if let Some(t) = self.transcript_for(idx) {
+            t.retime(start, old_end, new_end);
+        }
+    }
+
+    /// Cut several ranges out of the transcript's track (or every track), last first,
+    /// as one undo step. Used by text-based editing ("delete these words").
+    pub fn delete_ranges(
+        &mut self,
+        ranges: &[(usize, usize)],
+        all_tracks: bool,
+        label: &str,
+    ) -> bool {
+        let ranges = crate::transcript::merge_ranges(ranges.to_vec());
+        let Some(tt) = self.transcript_track() else {
+            return false;
+        };
+        if ranges.is_empty() {
+            return false;
+        }
+        self.push_undo(label);
+        let targets: Vec<usize> = if all_tracks {
+            (0..self.tracks.len()).collect()
+        } else {
+            vec![tt]
+        };
+        for &(s, e) in ranges.iter().rev() {
+            for &i in &targets {
+                let len = self.tracks[i].len();
+                if s < len {
+                    self.tracks[i].remove(s, e.min(len));
+                    self.retime_transcript(i, s, e.min(len), s);
+                }
+            }
+        }
+        self.selection = Selection::cursor(ranges[0].0);
         true
     }
 
@@ -250,7 +323,11 @@ impl Project {
     fn delete_range(&mut self) {
         let Selection { start, end } = self.selection;
         for i in self.target_tracks() {
+            let e = end.min(self.tracks[i].len());
             self.tracks[i].remove(start, end);
+            if e > start {
+                self.retime_transcript(i, start, e, start);
+            }
         }
         self.selection = Selection::cursor(start);
     }
@@ -277,7 +354,11 @@ impl Project {
         for (k, clip) in clips.iter().enumerate() {
             pasted_len = pasted_len.max(clip.first().map_or(0, Vec::len));
             if let Some(&ti) = targets.get(k) {
+                let len = self.tracks[ti].len();
+                let clip_len = clip.first().map_or(0, Vec::len);
                 self.tracks[ti].replace(start, end, clip);
+                let s = start.min(len);
+                self.retime_transcript(ti, s, end.min(len), s + clip_len);
             } else {
                 let mut padded = clip.clone();
                 for ch in &mut padded {
@@ -315,6 +396,10 @@ impl Project {
             let len = t.len();
             t.remove(end.min(len), len);
             t.remove(0, start);
+            if let Some(tr) = self.transcript_for(i) {
+                tr.retime(end.min(len), len, end.min(len));
+                tr.retime(0, start.min(len), 0);
+            }
         }
         self.selection = Selection::new(0, end - start);
         true
@@ -357,10 +442,141 @@ impl Project {
         true
     }
 
+    // ----- time shifting -----------------------------------------------------
+
+    /// How far track `idx` can move left: the length of its leading silence.
+    pub fn leading_silence(&self, idx: usize) -> usize {
+        let t = &self.tracks[idx];
+        let len = t.len();
+        (0..len)
+            .find(|&i| t.channels.iter().any(|c| c[i].abs() > SILENCE))
+            .unwrap_or(len)
+    }
+
+    /// Clamp a proposed time shift of track `idx` so audio never moves before 0.
+    pub fn clamp_track_shift(&self, idx: usize, delta: i64) -> i64 {
+        delta.max(-(self.leading_silence(idx) as i64))
+    }
+
+    /// Move a whole track along the timeline by `delta` samples (Time Shift tool).
+    /// Moving right inserts silence at the start; moving left removes leading silence
+    /// (and never audio). Returns the shift that was actually applied.
+    pub fn shift_track(&mut self, idx: usize, delta: i64) -> i64 {
+        if idx >= self.tracks.len() {
+            return 0;
+        }
+        let delta = self.clamp_track_shift(idx, delta);
+        if delta == 0 {
+            return 0;
+        }
+        self.push_undo("Time Shift");
+        let t = &mut self.tracks[idx];
+        if delta > 0 {
+            let n = t.num_channels();
+            t.insert(0, &vec![vec![0.0; delta as usize]; n]);
+        } else {
+            t.remove(0, (-delta) as usize);
+        }
+        let selected = t.selected;
+        if let Some(tr) = self.transcript_for(idx) {
+            tr.shift(delta);
+        }
+        if selected && !self.selection.is_empty() {
+            let s = (self.selection.start as i64 + delta).max(0) as usize;
+            self.selection = Selection::new(s, s + self.selection.len());
+        }
+        delta
+    }
+
+    /// Move the selected audio (the "clip") of the target tracks by `delta` samples,
+    /// leaving silence behind and overwriting whatever is at the destination.
+    /// If `dest_track` is given and exactly one track is being moved, the audio moves
+    /// onto that track instead. Returns false if there is nothing to move.
+    pub fn move_selection(&mut self, delta: i64, dest_track: Option<usize>) -> bool {
+        if self.selection.is_empty() || self.tracks.is_empty() {
+            return false;
+        }
+        let Selection { start, end } = self.selection;
+        let targets: Vec<usize> = self
+            .target_tracks()
+            .into_iter()
+            .filter(|&i| self.tracks[i].len() > start)
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let dest_track = dest_track.filter(|&d| targets.len() == 1 && d < self.tracks.len());
+        if delta == 0 && dest_track.is_none_or(|d| d == targets[0]) {
+            return false;
+        }
+        let new_start = (start as i64 + delta).max(0) as usize;
+        let len = end - start;
+        self.push_undo("Move Clip");
+        let clips: Vec<(usize, Vec<Vec<f32>>)> = targets
+            .iter()
+            .map(|&i| (i, self.tracks[i].extract(start, end)))
+            .collect();
+        for &(i, _) in &clips {
+            self.tracks[i].silence(start, end);
+        }
+        // Words travel with their audio; words under the destination are overwritten.
+        if let Some(tt) = self.transcript_track()
+            && let Some(tr) = self.transcript.as_mut().map(Arc::make_mut)
+        {
+            let new_track = |i: usize| dest_track.unwrap_or(i);
+            let moves_words = clips.iter().any(|&(i, _)| i == tt);
+            let mut moved: Vec<crate::transcript::Word> = Vec::new();
+            if moves_words {
+                let inside = tr.words_in(start, end);
+                for &k in inside.iter().rev() {
+                    moved.push(tr.words.remove(k));
+                }
+            }
+            if clips.iter().any(|&(i, _)| new_track(i) == tt) {
+                tr.drop_range(new_start, new_start + len);
+            }
+            if moves_words && new_track(tt) == tt {
+                for mut w in moved {
+                    w.start = (w.start as i64 + new_start as i64 - start as i64).max(0) as usize;
+                    w.end = (w.end as i64 + new_start as i64 - start as i64).max(0) as usize;
+                    tr.words.push(w);
+                }
+                tr.words.sort_by_key(|w| w.start);
+            }
+        }
+        for (i, data) in clips {
+            let ti = dest_track.unwrap_or(i);
+            let t = &mut self.tracks[ti];
+            let data = crate::track::adapt_channels(&data, t.num_channels());
+            t.pad_to(new_start + len);
+            let mut ch = 0;
+            t.process(new_start, new_start + len, |buf| {
+                let src = &data[ch.min(data.len() - 1)];
+                buf[..src.len().min(len)].copy_from_slice(&src[..src.len().min(len)]);
+                ch += 1;
+            });
+        }
+        if let Some(d) = dest_track {
+            for (j, t) in self.tracks.iter_mut().enumerate() {
+                t.selected = j == d;
+            }
+        }
+        self.selection = Selection::new(new_start, new_start + len);
+        true
+    }
+
     pub fn remove_track(&mut self, idx: usize) {
         if idx < self.tracks.len() {
             self.push_undo("Remove Track");
             self.tracks.remove(idx);
+            self.drop_orphan_transcript();
+        }
+    }
+
+    /// Forget the transcript if its track no longer exists.
+    pub fn drop_orphan_transcript(&mut self) {
+        if self.transcript.is_some() && self.transcript_track().is_none() {
+            self.transcript = None;
         }
     }
 
@@ -431,6 +647,7 @@ impl Project {
         let mut t = Track::new(id, "Mix", mix);
         t.selected = true;
         self.tracks.insert(insert_at.min(self.tracks.len()), t);
+        self.drop_orphan_transcript();
         true
     }
 }
@@ -468,6 +685,84 @@ mod tests {
         p.selection = Selection::new(3, 6);
         p.trim();
         assert_eq!(*p.tracks[0].channels[0], vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn shift_track_never_cuts_audio() {
+        let mut p = Project::default();
+        p.add_track("a", vec![vec![0.0, 0.0, 0.0, 1.0, 2.0]]);
+        assert_eq!(p.shift_track(0, 2), 2);
+        assert_eq!(
+            *p.tracks[0].channels[0],
+            [0.0; 5]
+                .iter()
+                .chain(&[1.0, 2.0])
+                .copied()
+                .collect::<Vec<_>>()
+        );
+        // Left by more than the leading silence is clamped.
+        assert_eq!(p.shift_track(0, -100), -5);
+        assert_eq!(*p.tracks[0].channels[0], vec![1.0, 2.0]);
+        assert_eq!(p.shift_track(0, -1), 0);
+        assert!(p.undo());
+        assert_eq!(p.tracks[0].len(), 7);
+    }
+
+    #[test]
+    fn move_selection_within_and_between_tracks() {
+        let mut p = Project::default();
+        p.add_track("a", vec![(1..=6).map(|i| i as f32).collect()]);
+        p.add_track("b", vec![vec![0.0; 2], vec![0.0; 2]]);
+        p.tracks[1].selected = false;
+        p.selection = Selection::new(0, 2);
+        // Move [1,2] right by 3 on the same track.
+        assert!(p.move_selection(3, None));
+        assert_eq!(*p.tracks[0].channels[0], vec![0.0, 0.0, 3.0, 1.0, 2.0, 6.0]);
+        assert_eq!(p.selection, Selection::new(3, 5));
+        // Move it onto the stereo track b, 1 sample earlier, past b's end.
+        assert!(p.move_selection(-1, Some(1)));
+        assert_eq!(*p.tracks[0].channels[0], vec![0.0, 0.0, 3.0, 0.0, 0.0, 6.0]);
+        assert_eq!(*p.tracks[1].channels[0], vec![0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(*p.tracks[1].channels[1], vec![0.0, 0.0, 1.0, 2.0]);
+        assert!(p.tracks[1].selected && !p.tracks[0].selected);
+        assert!(p.undo() && p.undo());
+        assert_eq!(*p.tracks[0].channels[0], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn transcript_follows_edits_and_undo() {
+        use crate::transcript::Word;
+        let mut p = Project::default();
+        p.add_track("voice", vec![(0..100).map(|i| i as f32).collect()]);
+        let w = |s, e, t: &str| Word {
+            start: s,
+            end: e,
+            text: t.into(),
+            prob: 1.0,
+        };
+        p.transcript = Some(Arc::new(Transcript {
+            track_id: p.tracks[0].id,
+            language: "en".into(),
+            words: vec![w(10, 20, "one"), w(30, 40, "um"), w(50, 60, "three")],
+        }));
+        // Text-based edit: delete "um".
+        assert!(p.delete_ranges(&[(30, 40)], true, "Delete words"));
+        assert_eq!(p.tracks[0].len(), 90);
+        assert_eq!(p.tracks[0].channels[0][30], 40.0);
+        let words = &p.transcript.as_ref().unwrap().words;
+        assert_eq!(words.len(), 2);
+        assert_eq!((words[1].start, words[1].end), (40, 50));
+        // Ordinary delete before the words shifts them too.
+        p.selection = Selection::new(0, 5);
+        p.delete();
+        assert_eq!(p.transcript.as_ref().unwrap().words[0].start, 5);
+        // Undo restores both audio and words.
+        assert!(p.undo() && p.undo());
+        assert_eq!(p.transcript.as_ref().unwrap().words.len(), 3);
+        assert_eq!(p.tracks[0].len(), 100);
+        // Removing the track drops the transcript.
+        p.remove_track(0);
+        assert!(p.transcript.is_none());
     }
 
     #[test]

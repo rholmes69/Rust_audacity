@@ -4,11 +4,13 @@
 //! Cursor, …) over the Model Context Protocol using the stdio transport:
 //! newline-delimited JSON-RPC 2.0 on stdin/stdout. Logs go to stderr.
 //!
-//! Usage:  rust_audacity_mcp [--root <dir>] [--demucs-command "<cmd>"]
+//! Usage:  rust_audacity_mcp [--root <dir>] [--demucs-command "<cmd>"] [--python <python>]
 //!   --root            only allow reading/writing files inside this folder (recommended)
+//!   --python          Python with faster-whisper installed, for transcribe_audio (default python/python3)
 //!   --demucs-command  command used for AI stem separation (default: "python -m demucs" on
 //!                     Windows, "demucs" elsewhere)
 
+mod app_tools;
 mod tools;
 
 use std::{
@@ -31,7 +33,11 @@ Typical workflow: (1) audio_info / analyze_audio to inspect a file – analyze_a
 parameters; (3) apply_effects / edit_audio / convert_audio / mix_audio to write a NEW output WAV file \
 (inputs are never modified unless output equals input and overwrite=true); (4) analyze the output to verify. \
 separate_stems splits music into vocals/drums/bass/other (AI via Demucs, or the instant 'builtin' engine for \
-vocals/instrumental). render_spectrogram returns a PNG image you can look at. Times are in seconds.";
+vocals/instrumental). render_spectrogram returns a PNG image you can look at. transcribe_audio turns speech into \
+text with word timings (Whisper). Times are in seconds. \
+The app_* tools instead drive the Rust Audacity window the user has open (start with app_status): open files, \
+select, edit, apply effects, play, export, save, and transcribe/edit speech by deleting words (app_transcript). \
+Changes there are visible to the user and can be undone (app_edit op=undo).";
 
 /// Shared, line-oriented stdout writer (one JSON message per line).
 #[derive(Clone)]
@@ -72,6 +78,8 @@ impl Progress {
 pub struct Config {
     pub root: Option<PathBuf>,
     pub demucs_command: String,
+    /// Python used for Whisper transcription.
+    pub python: String,
 }
 
 struct InFlight {
@@ -95,6 +103,7 @@ fn parse_args() -> Result<Config, String> {
         } else {
             "demucs".into()
         },
+        python: rust_audacity::whisper::default_python().into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -107,9 +116,10 @@ fn parse_args() -> Result<Config, String> {
             "--demucs-command" => {
                 cfg.demucs_command = args.next().ok_or("--demucs-command needs a value")?
             }
+            "--python" => cfg.python = args.next().ok_or("--python needs a value")?,
             "-h" | "--help" => {
                 eprintln!(
-                    "rust_audacity_mcp [--root <dir>] [--demucs-command \"<cmd>\"]\nMCP server over stdio; configure it in your MCP client."
+                    "rust_audacity_mcp [--root <dir>] [--demucs-command \"<cmd>\"] [--python <python>]\nMCP server over stdio; configure it in your MCP client."
                 );
                 std::process::exit(0);
             }

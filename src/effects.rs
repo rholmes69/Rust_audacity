@@ -706,35 +706,6 @@ fn apply_to_track(
     }
 }
 
-fn apply_inner(p: &mut Project, fx: &Effect) -> Result<(), String> {
-    let (start, end) = p.effect_range();
-    let rate = p.rate;
-    let profile = p.noise_profile.clone();
-    let mut longest = 0;
-    let mut skipped_mono = 0;
-    for ti in p.target_tracks() {
-        if fx.needs_stereo() && p.tracks[ti].num_channels() < 2 {
-            skipped_mono += 1;
-            continue;
-        }
-        longest = longest.max(apply_to_track(
-            &mut p.tracks[ti],
-            fx,
-            start,
-            end,
-            rate,
-            profile.as_ref(),
-        )?);
-    }
-    if skipped_mono > 0 && longest == 0 {
-        return Err(format!("{} only works on stereo tracks.", fx.name()));
-    }
-    if fx.length_policy() == LengthPolicy::Changes {
-        p.selection = Selection::new(start, start + longest);
-    }
-    Ok(())
-}
-
 fn check(p: &Project) -> Result<(), String> {
     if p.tracks.is_empty() {
         return Err("There is no audio to process.".into());
@@ -746,33 +717,172 @@ fn check(p: &Project) -> Result<(), String> {
     Ok(())
 }
 
+/// Error returned by [`EffectJob::run`] when the progress callback asks to stop.
+pub const CANCELLED: &str = "Cancelled";
+
+/// A self-contained effect (or chain) job.
+///
+/// The target tracks are cloned out of the project (cheap: channels are `Arc`s and only
+/// copied when written), processed — possibly on another thread — and the finished tracks
+/// are swapped back in with [`JobResult::commit`] as one undo step.
+pub struct EffectJob {
+    pub label: String,
+    chain: Vec<Effect>,
+    tracks: Vec<Track>,
+    start: usize,
+    end: usize,
+    rate: u32,
+    profile: Option<NoiseProfile>,
+}
+
+/// The output of a finished [`EffectJob`].
+pub struct JobResult {
+    pub label: String,
+    tracks: Vec<Track>,
+    selection: Option<Selection>,
+    /// Range the job processed, and whether it stretched/shrank audio inside it.
+    start: usize,
+    end: usize,
+    changes_length: bool,
+}
+
+impl EffectJob {
+    /// Capture everything needed to run `chain` on the project's current selection.
+    pub fn prepare(
+        p: &Project,
+        label: impl Into<String>,
+        chain: Vec<Effect>,
+    ) -> Result<Self, String> {
+        check(p)?;
+        if chain.is_empty() {
+            return Err("The chain is empty.".into());
+        }
+        let (start, end) = p.effect_range();
+        Ok(Self {
+            label: label.into(),
+            tracks: p
+                .target_tracks()
+                .into_iter()
+                .map(|i| p.tracks[i].clone())
+                .collect(),
+            chain,
+            start,
+            end,
+            rate: p.rate,
+            profile: p.noise_profile.clone(),
+        })
+    }
+
+    /// Number of progress steps (one per track per effect).
+    pub fn steps(&self) -> usize {
+        (self.tracks.len() * self.chain.len()).max(1)
+    }
+
+    /// Length of audio being processed, in samples (per track).
+    pub fn range_len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Process the tracks. `progress(done, total)` is called after every step; returning
+    /// `false` stops the job with [`CANCELLED`].
+    pub fn run(
+        mut self,
+        mut progress: impl FnMut(usize, usize) -> bool,
+    ) -> Result<JobResult, String> {
+        let total = self.steps();
+        let mut done = 0;
+        let mut end = self.end;
+        let mut selection = None;
+        let multi = self.chain.len() > 1;
+        for fx in &self.chain {
+            let mut longest = 0;
+            let mut skipped_mono = 0;
+            for t in &mut self.tracks {
+                if fx.needs_stereo() && t.num_channels() < 2 {
+                    skipped_mono += 1;
+                } else {
+                    let n =
+                        apply_to_track(t, fx, self.start, end, self.rate, self.profile.as_ref())
+                            .map_err(|e| {
+                                if multi {
+                                    format!("{}: {e}", fx.name())
+                                } else {
+                                    e
+                                }
+                            })?;
+                    longest = longest.max(n);
+                }
+                done += 1;
+                if !progress(done, total) {
+                    return Err(CANCELLED.into());
+                }
+            }
+            if skipped_mono > 0 && longest == 0 {
+                return Err(format!("{} only works on stereo tracks.", fx.name()));
+            }
+            if fx.length_policy() == LengthPolicy::Changes {
+                end = self.start + longest;
+                selection = Some(Selection::new(self.start, end));
+            }
+        }
+        let changes_length = self
+            .chain
+            .iter()
+            .any(|fx| fx.length_policy() == LengthPolicy::Changes);
+        Ok(JobResult {
+            label: self.label,
+            tracks: self.tracks,
+            selection,
+            start: self.start,
+            end: self.end,
+            changes_length,
+        })
+    }
+}
+
+impl JobResult {
+    /// Swap the processed tracks into the project as one undo step. Tracks that were
+    /// removed while the job ran are skipped. Returns false if nothing could be applied.
+    pub fn commit(self, p: &mut Project) -> bool {
+        if !self
+            .tracks
+            .iter()
+            .any(|t| p.tracks.iter().any(|o| o.id == t.id))
+        {
+            return false;
+        }
+        p.push_undo(self.label);
+        for t in self.tracks {
+            if let Some(idx) = p.tracks.iter().position(|o| o.id == t.id) {
+                let (old_len, new_len) = (p.tracks[idx].len(), t.len());
+                // Keep live UI state (mute/solo/gain/selection/height) as it is now.
+                p.tracks[idx].channels = t.channels;
+                if self.changes_length && new_len != old_len {
+                    let e = self.end.min(old_len);
+                    let ne = (e as i64 + new_len as i64 - old_len as i64).max(self.start as i64);
+                    p.retime_transcript(idx, self.start, e, ne as usize);
+                }
+            }
+        }
+        if let Some(sel) = self.selection {
+            p.selection = sel;
+        }
+        true
+    }
+}
+
 /// Apply an effect to the target tracks over the selection (or the whole project).
 /// Creates one undo step; on error the project is left unchanged.
 pub fn apply(p: &mut Project, fx: &Effect) -> Result<(), String> {
-    check(p)?;
-    p.push_undo(fx.name());
-    if let Err(e) = apply_inner(p, fx) {
-        p.undo();
-        p.discard_redo();
-        return Err(e);
-    }
+    let job = EffectJob::prepare(p, fx.name(), vec![*fx])?;
+    job.run(|_, _| true)?.commit(p);
     Ok(())
 }
 
 /// Apply several effects in sequence as a single undo step.
 pub fn apply_chain(p: &mut Project, name: &str, chain: &[Effect]) -> Result<(), String> {
-    check(p)?;
-    if chain.is_empty() {
-        return Err("The chain is empty.".into());
-    }
-    p.push_undo(name.to_string());
-    for fx in chain {
-        if let Err(e) = apply_inner(p, fx) {
-            p.undo();
-            p.discard_redo();
-            return Err(format!("{}: {e}", fx.name()));
-        }
-    }
+    let job = EffectJob::prepare(p, name, chain.to_vec())?;
+    job.run(|_, _| true)?.commit(p);
     Ok(())
 }
 
@@ -1080,6 +1190,65 @@ mod tests {
         let mut p = Project::default();
         p.add_track("t", vec![data]);
         p
+    }
+
+    #[test]
+    fn background_job_runs_off_thread_and_commits_once() {
+        let mut p = proj(vec![0.25; 1000]);
+        p.add_track("other", vec![vec![0.1; 1000]]);
+        p.tracks[1].selected = false;
+        let job = EffectJob::prepare(
+            &p,
+            "Louder then faster",
+            vec![
+                Effect::Amplify { db: 6.0206 },
+                Effect::ChangeSpeed { factor: 2.0 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(job.steps(), 2);
+        let mut calls = Vec::new();
+        let result = std::thread::spawn(move || {
+            let r = job.run(|d, t| {
+                calls.push((d, t));
+                true
+            });
+            (r, calls)
+        });
+        // The project can still be edited while the job runs.
+        p.tracks[1].gain = 0.5;
+        let (r, calls) = result.join().unwrap();
+        assert_eq!(calls, vec![(1, 2), (2, 2)]);
+        assert!(r.unwrap().commit(&mut p));
+        assert_eq!(p.tracks[0].len(), 500);
+        assert!((p.tracks[0].channels[0][10] - 0.5).abs() < 1e-4);
+        assert_eq!(p.selection, Selection::new(0, 500));
+        assert_eq!(p.tracks[1].len(), 1000, "unselected track untouched");
+        assert_eq!(p.tracks[1].gain, 0.5);
+        assert_eq!(p.undo_label(), Some("Louder then faster"));
+        assert!(p.undo());
+        assert_eq!(p.tracks[0].len(), 1000);
+    }
+
+    #[test]
+    fn cancelled_job_changes_nothing() {
+        let p = proj(vec![0.25; 100]);
+        let job = EffectJob::prepare(&p, "x", vec![Effect::Reverse, Effect::Invert]).unwrap();
+        let r = job.run(|_, _| false);
+        assert_eq!(r.err().as_deref(), Some(CANCELLED));
+        assert!(!p.can_undo());
+    }
+
+    #[test]
+    fn job_result_for_removed_track_is_dropped() {
+        let mut p = proj(vec![0.25; 100]);
+        let r = EffectJob::prepare(&p, "x", vec![Effect::Invert])
+            .unwrap()
+            .run(|_, _| true)
+            .unwrap();
+        p.tracks.clear();
+        assert!(!r.commit(&mut p));
+        assert!(!p.can_undo());
     }
 
     #[test]

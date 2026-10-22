@@ -10,7 +10,7 @@ use rust_audacity::{
         specgram,
     },
     effects::{self, Effect, Generator, NoiseKind, Waveform, builtin_chains},
-    fileio::{self, WavFormat},
+    fileio::{self, ExportFormat, WavFormat},
     project::{Project, Selection},
     track::{Track, adapt_channels, resample},
 };
@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{Config, Progress};
 
-type R<T> = Result<T, String>;
+pub(crate) type R<T> = Result<T, String>;
 
 /// What a tool returns: a human-readable summary, machine-readable JSON, and optionally a PNG.
 pub struct Output {
@@ -27,7 +27,8 @@ pub struct Output {
     pub png: Option<Vec<u8>>,
 }
 
-const TOOL_NAMES: [&str; 10] = [
+const TOOL_NAMES: [&str; 11] = [
+    "transcribe_audio",
     "audio_info",
     "analyze_audio",
     "list_effects",
@@ -41,7 +42,7 @@ const TOOL_NAMES: [&str; 10] = [
 ];
 
 pub fn exists(name: &str) -> bool {
-    TOOL_NAMES.contains(&name)
+    TOOL_NAMES.contains(&name) || crate::app_tools::exists(name)
 }
 
 // ---------------------------------------------------------------- definitions
@@ -71,7 +72,7 @@ fn p_num(desc: &str) -> Value {
     json!({ "type": "number", "description": desc })
 }
 fn p_format() -> Value {
-    json!({ "type": "string", "enum": ["pcm16", "pcm24", "float32"], "description": "WAV sample format of the output (default pcm24)." })
+    json!({ "type": "string", "enum": ["pcm16", "pcm24", "float32"], "description": "Sample format for WAV output (default pcm24). For .flac output, pcm16 gives 16-bit and anything else 24-bit. The output file type follows its extension: .wav, .flac, .mp3 or .ogg." })
 }
 
 pub fn definitions() -> Vec<Value> {
@@ -141,11 +142,13 @@ pub fn definitions() -> Vec<Value> {
              if omitted, from the quietest half-second automatically. Returns before/after loudness.",
             range(json!({
                 "input": p_path("Source audio file."),
-                "output": p_path("Output WAV path (default: <input>_processed.wav next to the input)."),
+                "output": p_path("Output path: .wav, .flac, .mp3 or .ogg (default: <input>_processed.wav next to the input)."),
                 "effects": { "type": "array", "items": effect_item, "description": "Effects to apply in order." },
                 "chain": { "type": "string", "description": "Name of a built-in chain from list_effects (e.g. \"Podcast Voice\"). Applied before `effects`." },
                 "noise_profile": { "type": "object", "properties": { "start": p_num("seconds"), "end": p_num("seconds") }, "description": "Noise-only range of the input used by noise_reduction." },
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
                 "overwrite": { "type": "boolean", "description": "Allow writing over the input file (default false)." },
             })),
             &["input"],
@@ -161,7 +164,7 @@ pub fn definitions() -> Vec<Value> {
              remove_silence {threshold_db=-50, min_duration=0.5, keep=0.2} shortens long pauses.",
             json!({
                 "input": p_path("Source audio file."),
-                "output": p_path("Output WAV path (default: <input>_edited.wav)."),
+                "output": p_path("Output path: .wav, .flac, .mp3 or .ogg (default: <input>_edited.wav)."),
                 "operations": { "type": "array", "items": { "type": "object", "properties": {
                     "op": { "type": "string", "enum": ["trim", "delete", "silence", "insert_silence", "fade_in", "fade_out", "gain", "reverse", "remove_silence"] },
                     "start": p_num("seconds"), "end": p_num("seconds"), "at": p_num("seconds"), "duration": p_num("seconds"),
@@ -169,6 +172,8 @@ pub fn definitions() -> Vec<Value> {
                     "min_duration": p_num("shortest pause to shorten, seconds"), "keep": p_num("seconds of pause to keep")
                   }, "required": ["op"] } },
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
                 "overwrite": { "type": "boolean" },
             }),
             &["input", "operations"],
@@ -178,14 +183,16 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "convert_audio",
             "Convert audio",
-            "Convert any supported audio file (MP3, FLAC, OGG, M4A, AIFF, WAV…) to WAV, optionally changing sample rate, channel count, bit depth, or normalizing loudness.",
+            "Convert any supported audio file (MP3, FLAC, OGG, M4A, AIFF, WAV…) to WAV, FLAC, MP3 or Ogg Vorbis (chosen by the output extension), optionally changing sample rate, channel count, bit depth, or normalizing loudness.",
             json!({
                 "input": p_path("Source audio file."),
-                "output": p_path("Output WAV path (default: <input>.wav or <input>_converted.wav)."),
+                "output": p_path("Output path; the extension picks the format: .wav, .flac, .mp3 or .ogg (default: <input>.wav or <input>_converted.wav)."),
                 "sample_rate": { "type": "integer", "description": "New sample rate in Hz, e.g. 44100 or 48000." },
                 "channels": { "type": "integer", "enum": [1, 2], "description": "1 = mono, 2 = stereo." },
                 "normalize_lufs": p_num("Normalize integrated loudness to this LUFS value (e.g. -14), with a -1 dB peak limiter."),
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
                 "overwrite": { "type": "boolean" },
             }),
             &["input"],
@@ -202,9 +209,11 @@ pub fn definitions() -> Vec<Value> {
                     "pan": p_num("-1 left … 0 centre … 1 right (default 0)."), "offset": p_num("Start time in the mix, seconds (default 0)."),
                     "mute": { "type": "boolean" }
                   }, "required": ["path"] } },
-                "output": p_path("Output WAV path."),
+                "output": p_path("Output path: .wav, .flac, .mp3 or .ogg."),
                 "normalize_peak_db": p_num("If set, scale the mix so its peak is this many dBFS (e.g. -1)."),
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
             }),
             &["inputs", "output"],
             false,
@@ -215,7 +224,7 @@ pub fn definitions() -> Vec<Value> {
             "Generate audio",
             "Create a test tone, noise or silence as a WAV file.",
             json!({
-                "output": p_path("Output WAV path."),
+                "output": p_path("Output path: .wav, .flac, .mp3 or .ogg."),
                 "kind": { "type": "string", "enum": ["tone", "noise", "silence"] },
                 "duration": p_num("Length in seconds."),
                 "frequency": p_num("Tone frequency in Hz (default 440)."),
@@ -225,6 +234,8 @@ pub fn definitions() -> Vec<Value> {
                 "sample_rate": { "type": "integer", "description": "Default 44100." },
                 "channels": { "type": "integer", "enum": [1, 2] },
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
             }),
             &["output", "kind", "duration"],
             false,
@@ -244,7 +255,10 @@ pub fn definitions() -> Vec<Value> {
                 "model": { "type": "string", "enum": ["htdemucs", "htdemucs_ft", "htdemucs_6s"], "description": "Demucs model (default htdemucs)." },
                 "two_stems": { "type": "boolean", "description": "Demucs: only vocals + no_vocals." },
                 "demucs_command": { "type": "string", "description": "Override the command used to run Demucs, e.g. \"python -m demucs\"." },
+                "file_type": { "type": "string", "enum": ["wav", "flac", "mp3", "ogg"], "description": "File type for the stems (default wav)." },
                 "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for .mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for .ogg output, 0 (small) to 10 (best); default 6." },
             })),
             &["input"],
             false,
@@ -266,7 +280,26 @@ pub fn definitions() -> Vec<Value> {
             false,
             false,
         ),
+        tool(
+            "transcribe_audio",
+            "Transcribe speech",
+            "Speech-to-text with OpenAI Whisper (runs locally via Python faster-whisper). Returns the text and word timings \
+             ([start, end, word] in seconds). Optionally writes subtitles (.srt), text (.txt) or JSON (.json). Use the word times \
+             with edit_audio (delete) to cut words, or open the file in the app and use app_transcript for text-based editing.",
+            range(json!({
+                "input": p_path("Audio file with speech."),
+                "model": { "type": "string", "enum": ["tiny", "base", "small", "medium", "turbo", "large-v3"], "description": "Whisper model (default small). Larger is more accurate but slower; downloads on first use." },
+                "language": { "type": "string", "description": "Language code like \"en\" (default: detect)." },
+                "output": p_path("Optional .srt, .txt or .json file to write."),
+            })),
+            &["input"],
+            false,
+            false,
+        ),
     ]
+    .into_iter()
+    .chain(crate::app_tools::definitions())
+    .collect()
 }
 
 pub fn to_result(r: R<Output>) -> Value {
@@ -291,7 +324,11 @@ pub fn call(
     progress: &Progress,
     cancel: &CancelHandle,
 ) -> R<Output> {
+    if crate::app_tools::exists(name) {
+        return crate::app_tools::call(name, args, cfg, progress);
+    }
     match name {
+        "transcribe_audio" => transcribe_audio(args, cfg, progress, cancel),
         "audio_info" => audio_info(args, cfg),
         "analyze_audio" => analyze_audio(args, cfg),
         "list_effects" => list_effects(),
@@ -308,16 +345,16 @@ pub fn call(
 
 // ---------------------------------------------------------------- helpers
 
-fn s<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
+pub(crate) fn s<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
     a.get(k).and_then(Value::as_str)
 }
-fn f(a: &Value, k: &str) -> Option<f64> {
+pub(crate) fn f(a: &Value, k: &str) -> Option<f64> {
     a.get(k).and_then(Value::as_f64)
 }
-fn b(a: &Value, k: &str) -> bool {
+pub(crate) fn b(a: &Value, k: &str) -> bool {
     a.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
-fn req_str<'a>(a: &'a Value, k: &str) -> R<&'a str> {
+pub(crate) fn req_str<'a>(a: &'a Value, k: &str) -> R<&'a str> {
     s(a, k).ok_or_else(|| format!("missing required argument `{k}`"))
 }
 
@@ -345,7 +382,7 @@ fn absolutize(cfg: &Config, raw: &str) -> PathBuf {
     }
 }
 
-fn input_path(cfg: &Config, raw: &str) -> R<PathBuf> {
+pub(crate) fn input_path(cfg: &Config, raw: &str) -> R<PathBuf> {
     let p = absolutize(cfg, raw);
     let p = std::fs::canonicalize(&p).map_err(|e| format!("cannot open {}: {e}", p.display()))?;
     check_root(cfg, &p)?;
@@ -355,7 +392,7 @@ fn input_path(cfg: &Config, raw: &str) -> R<PathBuf> {
     Ok(p)
 }
 
-fn output_path(cfg: &Config, raw: &str, ext: &str) -> R<PathBuf> {
+pub(crate) fn output_path(cfg: &Config, raw: &str, ext: &str) -> R<PathBuf> {
     let mut p = absolutize(cfg, raw);
     if p.extension().is_none() {
         p.set_extension(ext);
@@ -401,13 +438,62 @@ fn out_for(cfg: &Config, args: &Value, input: &Path, suffix: &str, ext: &str) ->
     Ok(out)
 }
 
-fn wav_format(args: &Value) -> R<WavFormat> {
-    match s(args, "format").unwrap_or("pcm24") {
-        "pcm16" => Ok(WavFormat::Pcm16),
-        "pcm24" => Ok(WavFormat::Pcm24),
-        "float32" => Ok(WavFormat::Float32),
-        o => Err(format!("unknown format {o} (use pcm16, pcm24 or float32)")),
+/// Output encoding settings; the file type itself comes from the output extension.
+#[derive(Clone, Copy, PartialEq)]
+struct OutFmt {
+    wav: WavFormat,
+    mp3_kbps: u32,
+    ogg_quality: u8,
+}
+
+impl OutFmt {
+    const FLOAT_WAV: OutFmt = OutFmt {
+        wav: WavFormat::Float32,
+        mp3_kbps: 192,
+        ogg_quality: 6,
+    };
+
+    fn for_path(&self, path: &Path) -> ExportFormat {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("wav")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "flac" => ExportFormat::Flac {
+                bits: if self.wav == WavFormat::Pcm16 { 16 } else { 24 },
+            },
+            "mp3" => ExportFormat::Mp3 {
+                kbps: self.mp3_kbps,
+            },
+            "ogg" | "oga" => ExportFormat::Ogg {
+                quality: self.ogg_quality,
+            },
+            _ => ExportFormat::Wav(self.wav),
+        }
     }
+}
+
+fn wav_format(args: &Value) -> R<OutFmt> {
+    let wav = match s(args, "format").unwrap_or("pcm24") {
+        "pcm16" => WavFormat::Pcm16,
+        "pcm24" => WavFormat::Pcm24,
+        "float32" => WavFormat::Float32,
+        o => return Err(format!("unknown format {o} (use pcm16, pcm24 or float32)")),
+    };
+    let mp3_kbps = f(args, "mp3_kbps").map_or(192, |k| k as u32);
+    if !fileio::MP3_BITRATES.contains(&mp3_kbps) {
+        return Err(format!(
+            "mp3_kbps must be one of {:?}",
+            fileio::MP3_BITRATES
+        ));
+    }
+    let ogg_quality = f(args, "ogg_quality").map_or(6.0, |q| q.clamp(0.0, 10.0)) as u8;
+    Ok(OutFmt {
+        wav,
+        mp3_kbps,
+        ogg_quality,
+    })
 }
 
 struct Audio {
@@ -432,8 +518,8 @@ fn load(path: &Path) -> R<Audio> {
     })
 }
 
-fn save(path: &Path, chans: &[Vec<f32>], rate: u32, fmt: WavFormat) -> R<()> {
-    fileio::export_wav(path, chans, rate, fmt).map_err(|e| format!("{e:#}"))
+fn save(path: &Path, chans: &[Vec<f32>], rate: u32, fmt: OutFmt) -> R<()> {
+    fileio::export(path, chans, rate, fmt.for_path(path)).map_err(|e| format!("{e:#}"))
 }
 
 /// Seconds → sample range, clamped. Errors if the range is empty.
@@ -460,7 +546,111 @@ fn db(x: f32) -> Value {
     }
 }
 
-fn round3(x: f64) -> f64 {
+fn transcribe_audio(
+    args: &Value,
+    cfg: &Config,
+    progress: &Progress,
+    cancel: &CancelHandle,
+) -> R<Output> {
+    use rust_audacity::whisper::{self, WhisperEvent, WhisperModel, WhisperOptions};
+    let input = input_path(cfg, req_str(args, "input")?)?;
+    let model = match s(args, "model") {
+        Some(m) => WhisperModel::from_id(m).ok_or_else(|| format!("unknown model {m}"))?,
+        None => WhisperModel::Small,
+    };
+    let a = load(&input)?;
+    let (start, end) = range(args, a.rate, a.len())?;
+    let chans: Vec<Vec<f32>> = a.chans.iter().map(|c| c[start..end].to_vec()).collect();
+    let audio = whisper::prepare_audio(&chans, a.rate);
+    let opts = WhisperOptions {
+        python: cfg.python.clone(),
+        model,
+        language: s(args, "language").unwrap_or("").to_string(),
+        env: Vec::new(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p2 = progress.clone();
+    let fwd = std::thread::spawn(move || {
+        let mut last = String::new();
+        for ev in rx {
+            match ev {
+                WhisperEvent::Progress(p) => {
+                    p2.report((p * 100.0) as f64, Some(100.0), "Transcribing")
+                }
+                WhisperEvent::Status(st) if st != last => {
+                    p2.report(0.0, None, &st);
+                    last = st;
+                }
+                _ => {}
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let result = whisper::run_whisper(&opts, &audio, &tx, cancel).map_err(|e| format!("{e:#}"));
+    drop(tx);
+    let _ = fwd.join();
+    let t = result?;
+    let offset = start as f64 / a.rate as f64;
+    let words: Vec<Value> = t
+        .words
+        .iter()
+        .map(|w| json!([round3(w.start + offset), round3(w.end + offset), w.text]))
+        .collect();
+    // Build a transcript at 1 kHz "samples" (= milliseconds) for text/SRT output.
+    let tr = t
+        .clone()
+        .into_transcript(0, 1000, (offset * 1000.0).round() as usize);
+    let text = tr.to_text(1500);
+    let mut written = None;
+    if let Some(o) = s(args, "output") {
+        let ext = Path::new(o)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("txt")
+            .to_ascii_lowercase();
+        let path = output_path(cfg, o, &ext)?;
+        let body = match ext.as_str() {
+            "srt" => tr.to_srt(1000, 42),
+            "json" => {
+                serde_json::to_string_pretty(&json!({ "language": t.language, "words": words }))
+                    .unwrap_or_default()
+            }
+            _ => text.clone(),
+        };
+        std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+        written = Some(path.display().to_string());
+    }
+    let data = json!({
+        "language": t.language,
+        "engine": t.engine,
+        "model": model.id(),
+        "word_count": words.len(),
+        "words": words,
+        "text": text,
+        "output": written,
+        "seconds_taken": round3(started.elapsed().as_secs_f64()),
+    });
+    let shown = if text.len() > 8000 {
+        format!("{}…", &text[..text.floor_char_boundary(8000)])
+    } else {
+        text.clone()
+    };
+    Ok(Output {
+        text: format!(
+            "Transcribed {} ({} words, language {}, {}, {:.1}s){}:\n\n{shown}",
+            input.display(),
+            t.words.len(),
+            t.language,
+            t.engine,
+            started.elapsed().as_secs_f64(),
+            written.map(|w| format!(", wrote {w}")).unwrap_or_default()
+        ),
+        data,
+        png: None,
+    })
+}
+
+pub(crate) fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
 }
 
@@ -513,7 +703,7 @@ fn pretty(v: &Value) -> String {
 
 // ---------------------------------------------------------------- effect specs
 
-fn norm(name: &str) -> String {
+pub(crate) fn norm(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
@@ -565,7 +755,7 @@ fn describe(fx: &Effect) -> &'static str {
     }
 }
 
-fn parse_effect(spec: &Value) -> R<Effect> {
+pub(crate) fn parse_effect(spec: &Value) -> R<Effect> {
     let (name, params) = match spec {
         Value::String(n) => (n.clone(), Map::new()),
         Value::Object(m) => {
@@ -1331,7 +1521,7 @@ fn mix_audio(args: &Value, cfg: &Config) -> R<Output> {
     save(&out, &mix, p.rate, fmt)?;
     let st = analysis::measure(&mix, p.rate);
     let mut warn = String::new();
-    if st.peak_db > 0.0 && fmt != WavFormat::Float32 {
+    if st.peak_db > 0.0 && fmt.for_path(&out).clips_above_full_scale() {
         warn = format!(
             "\nWarning: mix peaked at {:.1} dBFS and was clipped – lower gains or set normalize_peak_db.",
             st.peak_db
@@ -1409,6 +1599,10 @@ fn separate_stems(
 ) -> R<Output> {
     let input = input_path(cfg, req_str(args, "input")?)?;
     let fmt = wav_format(args)?;
+    let stem_ext = match s(args, "file_type").unwrap_or("wav") {
+        t @ ("wav" | "flac" | "mp3" | "ogg") => t,
+        o => return Err(format!("unknown file_type {o} (wav, flac, mp3 or ogg)")),
+    };
     let stem_base = input
         .file_stem()
         .unwrap_or_default()
@@ -1474,7 +1668,7 @@ fn separate_stems(
                     .map(|c| if c.is_alphanumeric() { c } else { '_' })
                     .collect::<String>()
             ));
-            save(&wav_in, &chans, a.rate, WavFormat::Float32)?;
+            save(&wav_in, &chans, a.rate, OutFmt::FLOAT_WAV)?;
             let (tx, rx) = std::sync::mpsc::channel::<StemEvent>();
             let p2 = progress.clone();
             let fwd = std::thread::spawn(move || {
@@ -1515,7 +1709,7 @@ fn separate_stems(
     };
     let mut files = Vec::new();
     for (name, chans, rate) in &stems {
-        let path = out_dir.join(format!("{stem_base}_{name}.wav"));
+        let path = out_dir.join(format!("{stem_base}_{name}.{stem_ext}"));
         save(&path, chans, *rate, fmt)?;
         let st = analysis::measure(chans, *rate);
         files.push(json!({ "stem": name, "path": path.display().to_string(), "duration_secs": round3(st.duration_secs), "rms_dbfs": db(st.rms_db) }));

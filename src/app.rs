@@ -13,8 +13,9 @@ use eframe::egui::{
 use crate::{
     effects::{self, Category, Effect, Generator, NoiseKind, Waveform, db_to_lin, lin_to_db},
     engine::{Engine, Shared},
-    fileio::{self, DecodedAudio, WavFormat},
+    fileio::{self, DecodedAudio, ExportFormat},
     project::{Project, Selection},
+    projectfile,
     spectrogram::{self, SpectrogramCache},
     track::{Track, TrackView, adapt_channels},
     waveform::{self, SummaryCache},
@@ -41,8 +42,36 @@ impl View {
 }
 
 mod analyze_ui;
+mod bridge_ui;
+mod file_ui;
 mod fx_ui;
+mod jobs_ui;
 mod stems_ui;
+mod transcript_ui;
+
+use file_ui::Pending;
+
+/// Mouse tool for the track area.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    /// Click and drag to select time ranges.
+    Select,
+    /// Drag tracks or the selected audio along the timeline.
+    TimeShift,
+}
+
+/// An in-progress Time Shift drag.
+struct ShiftDrag {
+    /// Track the drag started on.
+    track: usize,
+    start_x: f32,
+    /// Moving the selected audio (true) or the whole track (false).
+    clip: bool,
+    /// Current offset in samples (already clamped).
+    delta: i64,
+    /// Track under the pointer (for moving a clip to another track).
+    dest: Option<usize>,
+}
 
 #[derive(Clone)]
 enum Dialog {
@@ -63,9 +92,10 @@ enum Dialog {
         secs: f32,
     },
     Export {
-        fmt: WavFormat,
+        fmt: ExportFormat,
         selection_only: bool,
     },
+    ConfirmUnsaved(Pending),
     Shortcuts,
     About,
     Message(String),
@@ -153,6 +183,23 @@ pub struct AudacityApp {
     chains: fx_ui::ChainsState,
     analysis: Option<analyze_ui::AnalysisWindow>,
     stems: stems_ui::StemsState,
+    /// Where the project was last saved / opened from.
+    project_path: Option<PathBuf>,
+    /// Set once the user has agreed to close (so the close request isn't intercepted again).
+    close_confirmed: bool,
+    egui_ctx: egui::Context,
+    /// Effect or export running in the background.
+    job: Option<jobs_ui::RunningJob>,
+    /// Last export format used (remembered between sessions).
+    export_fmt: ExportFormat,
+    tool: Tool,
+    shift: Option<ShiftDrag>,
+    /// Track rectangles from the previous frame (for hit-testing during drags).
+    prev_track_rects: Vec<(usize, Rect)>,
+    /// Zoom to fit once the track area's size is known (after opening a project).
+    fit_pending: bool,
+    transcript: transcript_ui::TranscriptState,
+    bridge: bridge_ui::BridgeState,
 }
 
 impl AudacityApp {
@@ -189,6 +236,17 @@ impl AudacityApp {
             chains: fx_ui::ChainsState::load(cc.storage),
             analysis: None,
             stems: stems_ui::StemsState::load(cc.storage),
+            project_path: None,
+            close_confirmed: false,
+            egui_ctx: cc.egui_ctx.clone(),
+            job: None,
+            export_fmt: Self::load_export_format(cc.storage),
+            tool: Tool::Select,
+            shift: None,
+            prev_track_rects: Vec::new(),
+            fit_pending: false,
+            transcript: transcript_ui::TranscriptState::load(cc.storage),
+            bridge: bridge_ui::BridgeState::load(cc.storage),
         };
         for f in files {
             app.import_path(f);
@@ -199,7 +257,7 @@ impl AudacityApp {
     // ------------------------------------------------------------------ helpers
 
     fn busy(&self) -> bool {
-        self.recording.is_some()
+        self.recording.is_some() || self.job.is_some() || self.transcript.running()
     }
 
     fn rate(&self) -> f64 {
@@ -225,6 +283,10 @@ impl AudacityApp {
     }
 
     fn import_path(&mut self, path: PathBuf) {
+        if projectfile::is_project_path(&path) {
+            self.confirm_then(Pending::Open(Some(path)));
+            return;
+        }
         let tx = self.import_tx.clone();
         self.importing += 1;
         self.status = format!("Importing {}…", path.display());
@@ -435,22 +497,9 @@ impl AudacityApp {
         }
     }
 
-    fn apply_effect(&mut self, fx: &Effect) -> bool {
-        if self.busy() {
-            return false;
-        }
-        self.engine.stop_playback();
-        self.previewing = false;
-        match effects::apply(&mut self.project, fx) {
-            Ok(()) => {
-                self.status = format!("Applied {}", fx.name());
-                true
-            }
-            Err(e) => {
-                self.dialog = Some(Dialog::Message(format!("{}: {e}", fx.name())));
-                false
-            }
-        }
+    /// Apply an effect in the background (one undo step).
+    fn apply_effect(&mut self, fx: &Effect) {
+        self.start_effect_job(fx.name().to_string(), vec![*fx]);
     }
 
     /// Menu entry for an effect: open its dialog, or apply directly if it has no settings.
@@ -473,39 +522,9 @@ impl AudacityApp {
         self.dialog = Some(Dialog::Effect(fx));
     }
 
-    fn export(&mut self, fmt: WavFormat, selection_only: bool) {
-        let (s, e) = if selection_only && !self.project.selection.is_empty() {
-            (self.project.selection.start, self.project.selection.end)
-        } else {
-            (0, self.project.len())
-        };
-        if e <= s {
-            self.dialog = Some(Dialog::Message("There is no audio to export.".into()));
-            return;
-        }
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("WAV audio", &["wav"])
-            .set_file_name(format!("{}.wav", self.title))
-            .save_file()
-        else {
-            return;
-        };
-        let mix = self.project.mixdown(s, e, selection_only);
-        let peak = mix.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
-        if let Some(()) = self.report(fileio::export_wav(&path, &mix, self.project.rate, fmt)) {
-            self.status = format!("Exported {}", path.display());
-            if peak > 1.0 && fmt != WavFormat::Float32 {
-                self.dialog = Some(Dialog::Message(format!(
-                    "Exported, but the mix peaked at {:.1} dBFS and was clipped.\nTry Effect ▸ Normalize first.",
-                    lin_to_db(peak)
-                )));
-            }
-        }
-    }
-
     fn new_project(&mut self) {
         self.stop();
-        self.project = Project::default();
+        self.reset_to_new_project();
         self.title = "Untitled".into();
         self.view = View {
             left: 0.0,
@@ -558,6 +577,7 @@ impl AudacityApp {
         self.engine.stop_playback();
         self.project.push_undo("Remove Tracks");
         self.project.tracks.retain(|t| !t.selected);
+        self.project.drop_orphan_transcript();
     }
 
     // --------------------------------------------------------------- shortcuts
@@ -578,17 +598,32 @@ impl AudacityApp {
         if sc(cmd, Key::Z) && !self.busy() && self.project.undo() {
             self.engine.stop_playback();
         }
-        if sc(cmd_shift, Key::I) || sc(cmd, Key::O) {
+        if sc(cmd_shift, Key::I) {
             self.import_dialog();
         }
+        if sc(cmd, Key::O) {
+            self.confirm_then(Pending::Open(None));
+        }
+        if sc(cmd_shift, Key::S) {
+            self.save_project(true);
+        }
+        if sc(cmd, Key::S) {
+            self.save_project(false);
+        }
         if sc(cmd_shift, Key::E) {
-            self.dialog = Some(Dialog::Export {
-                fmt: WavFormat::Pcm16,
-                selection_only: false,
-            });
+            self.open_export_dialog(false);
         }
         if sc(cmd, Key::N) {
-            self.new_project();
+            self.confirm_then(Pending::New);
+        }
+        if sc(cmd_shift, Key::T) {
+            self.transcript.show_panel ^= true;
+        }
+        if sc(Modifiers::NONE, Key::F1) {
+            self.tool = Tool::Select;
+        }
+        if sc(Modifiers::NONE, Key::F5) {
+            self.tool = Tool::TimeShift;
         }
         if sc(cmd, Key::X) {
             self.do_edit(Project::cut, "Cut");
@@ -701,32 +736,51 @@ impl AudacityApp {
     fn menu_bar(&mut self, ui: &mut Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New                      Ctrl+N").clicked() {
-                    self.new_project();
+                let idle = !self.busy();
+                let item = |ui: &mut Ui, label: &str, key: &str, enabled: bool| {
+                    ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(key))
+                        .clicked()
+                };
+                if item(ui, "New", "Ctrl+N", idle) {
                     ui.close();
+                    self.confirm_then(Pending::New);
                 }
-                if ui.button("Import Audio…      Ctrl+Shift+I").clicked() {
+                if item(ui, "Open Project…", "Ctrl+O", idle) {
+                    ui.close();
+                    self.confirm_then(Pending::Open(None));
+                }
+                let has_audio = !self.project.tracks.is_empty();
+                if item(ui, "Save Project", "Ctrl+S", idle && has_audio) {
+                    ui.close();
+                    self.save_project(false);
+                }
+                if item(ui, "Save Project As…", "Ctrl+Shift+S", idle && has_audio) {
+                    ui.close();
+                    self.save_project(true);
+                }
+                ui.separator();
+                if item(ui, "Import Audio…", "Ctrl+Shift+I", true) {
                     ui.close();
                     self.import_dialog();
                 }
                 ui.separator();
-                if ui.button("Export as WAV…     Ctrl+Shift+E").clicked() {
-                    self.dialog = Some(Dialog::Export {
-                        fmt: WavFormat::Pcm16,
-                        selection_only: false,
-                    });
+                if item(ui, "Export Audio…", "Ctrl+Shift+E", idle && has_audio) {
                     ui.close();
+                    self.open_export_dialog(false);
                 }
-                if ui.button("Export Selection…").clicked() {
-                    self.dialog = Some(Dialog::Export {
-                        fmt: WavFormat::Pcm16,
-                        selection_only: true,
-                    });
+                if item(
+                    ui,
+                    "Export Selection…",
+                    "",
+                    idle && !self.project.selection.is_empty(),
+                ) {
                     ui.close();
+                    self.open_export_dialog(true);
                 }
                 ui.separator();
                 if ui.button("Exit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.close();
+                    self.confirm_then(Pending::Exit);
                 }
             });
 
@@ -737,7 +791,7 @@ impl AudacityApp {
                 };
                 if ui
                     .add_enabled(
-                        self.project.can_undo(),
+                        self.project.can_undo() && !self.busy(),
                         egui::Button::new(undo).shortcut_text("Ctrl+Z"),
                     )
                     .clicked()
@@ -752,7 +806,7 @@ impl AudacityApp {
                 };
                 if ui
                     .add_enabled(
-                        self.project.can_redo(),
+                        self.project.can_redo() && !self.busy(),
                         egui::Button::new(redo).shortcut_text("Ctrl+Y"),
                     )
                     .clicked()
@@ -823,6 +877,17 @@ impl AudacityApp {
                     .clicked()
                 {
                     self.zoom_fit(self.last_track_area.width());
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Button::selectable(self.transcript.show_panel, "Transcript Panel")
+                            .shortcut_text("Ctrl+Shift+T"),
+                    )
+                    .clicked()
+                {
+                    self.transcript.show_panel ^= true;
                     ui.close();
                 }
                 ui.separator();
@@ -936,6 +1001,17 @@ impl AudacityApp {
                     ui.close();
                     self.open_analysis();
                 }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        !self.busy(),
+                        egui::Button::new("Transcribe Speech (Whisper)…"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.open_transcribe_dialog();
+                }
             });
 
             ui.menu_button("Stems", |ui| {
@@ -948,6 +1024,41 @@ impl AudacityApp {
                     self.open_effect(Effect::VocalRemover {
                         keep_bass_hz: 150.0,
                     });
+                }
+            });
+
+            ui.menu_button("Agents", |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.bridge.enabled,
+                        "Allow AI agents to control this window",
+                    )
+                    .changed()
+                {
+                    self.bridge.error = None;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Agents connected through the Rust Audacity MCP server\n\
+                         (Claude, Cursor, Ollama via rust_audacity_chat…) can use the\n\
+                         app_* tools to edit what is open here. Only programs on\n\
+                         this computer, running as you, can connect.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if let Some(e) = &self.bridge.error {
+                    ui.colored_label(Color32::from_rgb(230, 120, 90), e);
+                }
+                if let Some(t) = self.bridge.last_request {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Last agent command: {} ({:.0} s ago)",
+                            self.bridge.last_command,
+                            t.elapsed().as_secs_f32()
+                        ))
+                        .small(),
+                    );
                 }
             });
 
@@ -1035,6 +1146,24 @@ impl AudacityApp {
                 self.looping = !self.looping;
             }
 
+            ui.separator();
+            if ui
+                .add(egui::Button::new(big("I")).selected(self.tool == Tool::Select))
+                .on_hover_text("Selection tool (F1): drag to select audio")
+                .clicked()
+            {
+                self.tool = Tool::Select;
+            }
+            if ui
+                .add(egui::Button::new(big("↔")).selected(self.tool == Tool::TimeShift))
+                .on_hover_text(
+                    "Time Shift tool (F5): drag a track to move it in time,\n\
+                     or drag inside the selection to move that audio (also onto another track)",
+                )
+                .clicked()
+            {
+                self.tool = Tool::TimeShift;
+            }
             ui.separator();
             let pos = if playing || recording {
                 if recording {
@@ -1152,6 +1281,13 @@ impl AudacityApp {
             if self.importing > 0 {
                 ui.spinner();
             }
+            if self.bridge.active_recently() {
+                ui.label(
+                    egui::RichText::new(format!("🤖 Agent: {}", self.bridge.last_command))
+                        .color(Color32::from_rgb(140, 200, 255)),
+                );
+                ui.separator();
+            }
             ui.label(&self.status);
         });
     }
@@ -1195,6 +1331,10 @@ impl AudacityApp {
         );
         self.last_track_area =
             Rect::from_min_max(pos2(wave_left, tracks_rect.top()), tracks_rect.max);
+        if self.fit_pending {
+            self.fit_pending = false;
+            self.zoom_fit(self.last_track_area.width());
+        }
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(tracks_rect));
         if self.project.tracks.is_empty() {
@@ -1209,7 +1349,7 @@ impl AudacityApp {
             return;
         }
 
-        self.track_rects.clear();
+        self.prev_track_rects = std::mem::take(&mut self.track_rects);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
@@ -1502,8 +1642,16 @@ impl AudacityApp {
         );
 
         let sel = self.project.selection;
+        // While a whole track is being time-shifted, draw it at its new position.
+        let shift_preview = match &self.shift {
+            Some(sd) if !sd.clip && sd.track == i => sd.delta as f64,
+            _ => 0.0,
+        };
+        let draw_left = self.view.left - shift_preview;
         // End-of-audio shading.
-        let end_x = self.view.sample_to_x(rect, track.len() as f64);
+        let end_x = self
+            .view
+            .sample_to_x(rect, track.len() as f64 + shift_preview);
         if end_x < rect.right() {
             painter.rect_filled(
                 Rect::from_min_max(pos2(end_x.max(rect.left()), rect.top()), rect.max),
@@ -1540,7 +1688,7 @@ impl AudacityApp {
                     rev,
                     data,
                     self.project.rate,
-                    self.view.left,
+                    draw_left,
                     self.view.spp,
                     w,
                     h,
@@ -1577,7 +1725,7 @@ impl AudacityApp {
                     lane.shrink2(vec2(0.0, 2.0)),
                     data,
                     blocks,
-                    self.view.left,
+                    draw_left,
                     self.view.spp,
                     self.vzoom,
                     &colors,
@@ -1593,6 +1741,8 @@ impl AudacityApp {
                 );
             }
         }
+
+        self.draw_word_labels(&painter, i, rect, draw_left);
 
         // Selection highlight.
         if selected && !sel.is_empty() {
@@ -1630,8 +1780,41 @@ impl AudacityApp {
             );
         }
 
+        // Ghost of the selected audio while it is being dragged with the Time Shift tool.
+        if let Some(sd) = &self.shift
+            && sd.clip
+        {
+            let n_sel = self.project.tracks.iter().filter(|t| t.selected).count();
+            let on_this = match sd.dest {
+                Some(d) if n_sel == 1 => d == i,
+                _ => selected,
+            };
+            if on_this {
+                let s0 = (sel.start as i64 + sd.delta).max(0) as f64;
+                let x0 = self.view.sample_to_x(rect, s0);
+                let x1 = self.view.sample_to_x(rect, s0 + sel.len() as f64);
+                let ghost =
+                    Rect::from_min_max(pos2(x0, rect.top() + 2.0), pos2(x1, rect.bottom() - 2.0));
+                painter.rect_filled(
+                    ghost,
+                    CornerRadius::same(3),
+                    Color32::from_rgba_unmultiplied(255, 210, 90, 40),
+                );
+                painter.rect_stroke(
+                    ghost,
+                    CornerRadius::same(3),
+                    Stroke::new(1.5, Color32::from_rgb(255, 210, 90)),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+
         // Interaction.
         if self.busy() {
+            return;
+        }
+        if self.tool == Tool::TimeShift {
+            self.time_shift_interaction(ui, i, rect, &resp);
             return;
         }
         let ptr = ui
@@ -1708,6 +1891,93 @@ impl AudacityApp {
         }
     }
 
+    /// Time Shift tool: drag a whole track, or the selected audio, along the timeline.
+    fn time_shift_interaction(&mut self, ui: &Ui, i: usize, rect: Rect, resp: &egui::Response) {
+        let sel = self.project.selection;
+        if resp.drag_started()
+            && let Some(p) = ui.input(|inp| inp.pointer.press_origin())
+        {
+            let s = self.view.x_to_sample(rect, p.x).max(0.0) as usize;
+            let t = &self.project.tracks[i];
+            let clip = t.selected && !sel.is_empty() && s >= sel.start && s < sel.end;
+            self.shift = Some(ShiftDrag {
+                track: i,
+                start_x: p.x,
+                clip,
+                delta: 0,
+                dest: None,
+            });
+        }
+        if resp.dragged()
+            && let Some(p) = ui.input(|inp| inp.pointer.interact_pos())
+            && let Some(sd) = &self.shift
+        {
+            let raw = ((p.x - sd.start_x) as f64 * self.view.spp).round() as i64;
+            let (clip, track) = (sd.clip, sd.track);
+            let delta = if clip {
+                raw.max(-(sel.start as i64))
+            } else {
+                self.project.clamp_track_shift(track, raw)
+            };
+            let dest = self
+                .prev_track_rects
+                .iter()
+                .find(|(_, r)| p.y >= r.top() && p.y <= r.bottom())
+                .map(|(ti, _)| *ti);
+            if let Some(sd) = &mut self.shift {
+                sd.delta = delta;
+                sd.dest = dest;
+            }
+            let what = if clip { "selection" } else { "track" };
+            self.status = format!(
+                "Moving {what} by {:+.3} s{}",
+                delta as f64 / self.rate(),
+                match dest {
+                    Some(d) if clip && d != track =>
+                        format!(" → “{}”", self.project.tracks[d].name),
+                    _ => String::new(),
+                }
+            );
+        }
+        if resp.drag_stopped()
+            && let Some(sd) = self.shift.take()
+        {
+            self.engine.stop_playback();
+            let secs = sd.delta as f64 / self.rate();
+            if sd.clip {
+                let dest = sd.dest.filter(|&d| d != sd.track);
+                if self.project.move_selection(sd.delta, dest) {
+                    self.status = format!("Moved selection by {secs:+.3} s");
+                } else {
+                    self.status = "Nothing moved".into();
+                }
+            } else {
+                let applied = self.project.shift_track(sd.track, sd.delta);
+                self.status = if applied == 0 && sd.delta == 0 {
+                    "Nothing moved".into()
+                } else {
+                    format!("Moved track by {:+.3} s", applied as f64 / self.rate())
+                };
+            }
+        }
+        if resp.clicked() {
+            // A plain click selects the track (Ctrl adds to the selection).
+            let ctrl = ui.input(|inp| inp.modifiers.command);
+            if ctrl {
+                self.project.tracks[i].selected ^= true;
+            } else {
+                for (j, t) in self.project.tracks.iter_mut().enumerate() {
+                    t.selected = j == i;
+                }
+            }
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+    }
+
     // ----------------------------------------------------------------- dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1718,8 +1988,12 @@ impl AudacityApp {
             self.effect_dialog(ctx, fx);
             return;
         }
+        if let Dialog::ConfirmUnsaved(action) = d {
+            self.confirm_dialog(ctx, action);
+            return;
+        }
         let title = match &d {
-            Dialog::Effect(_) => "Effect",
+            Dialog::Effect(_) | Dialog::ConfirmUnsaved(_) => "Effect",
             Dialog::Tone { .. } => "Generate Tone",
             Dialog::Noise { .. } => "Generate Noise",
             Dialog::InsertSilence { .. } => "Generate Silence",
@@ -1741,7 +2015,7 @@ impl AudacityApp {
                     .num_columns(2)
                     .spacing([12.0, 8.0])
                     .show(ui, |ui| match &mut d {
-                        Dialog::Effect(_) => {}
+                        Dialog::Effect(_) | Dialog::ConfirmUnsaved(_) => {}
                         Dialog::Tone {
                             wave,
                             freq,
@@ -1818,17 +2092,8 @@ impl AudacityApp {
                             fmt,
                             selection_only,
                         } => {
-                            ui.label("Format:");
-                            egui::ComboBox::from_id_salt("fmt")
-                                .selected_text(format!("WAV, {}", fmt.label()))
-                                .show_ui(ui, |ui| {
-                                    for f in
-                                        [WavFormat::Pcm16, WavFormat::Pcm24, WavFormat::Float32]
-                                    {
-                                        ui.selectable_value(fmt, f, format!("WAV, {}", f.label()));
-                                    }
-                                });
-                            ui.end_row();
+                            Self::export_format_ui(ui, fmt);
+                            ui.label("");
                             ui.checkbox(selection_only, "Selected audio only");
                             ui.end_row();
                         }
@@ -1854,8 +2119,13 @@ impl AudacityApp {
                                 ("Ctrl+E / Ctrl+F", "Zoom to selection / fit"),
                                 ("Ctrl+wheel", "Zoom at pointer"),
                                 ("Shift+wheel", "Scroll horizontally"),
+                                ("F1 / F5", "Selection tool / Time Shift tool"),
+                                ("Ctrl+Shift+T", "Show / hide the transcript panel"),
+                                ("Ctrl+N", "New project"),
+                                ("Ctrl+O", "Open project"),
+                                ("Ctrl+S / Ctrl+Shift+S", "Save project / Save As"),
                                 ("Ctrl+Shift+I", "Import audio"),
-                                ("Ctrl+Shift+E", "Export WAV"),
+                                ("Ctrl+Shift+E", "Export audio (WAV/FLAC/MP3/OGG)"),
                             ] {
                                 ui.monospace(k);
                                 ui.label(v);
@@ -1864,8 +2134,9 @@ impl AudacityApp {
                         }
                         Dialog::About => {
                             ui.label(
-                            "Rust Audacity 0.2\nAn Audacity-style audio editor written in Rust.\n\n\
+                            "Rust Audacity 0.4\nAn Audacity-style audio editor written in Rust.\n\n\
                              egui/eframe · cpal · symphonia · hound · realfft · ebur128\n\
+                             flacenc · LAME (MP3) · libvorbis/aoTuV (Ogg)\n\
                              AI stem separation via Meta's Demucs (optional, external).",
                         );
                             ui.end_row();
@@ -1950,6 +2221,16 @@ impl eframe::App for AudacityApp {
         self.pump_recording();
         self.poll_imports(self.last_track_area.width().max(600.0));
         self.poll_stems(&ctx);
+        self.poll_job(&ctx);
+        self.poll_transcription(&ctx);
+        self.poll_bridge(&ctx);
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.close_confirmed
+            && self.has_unsaved_changes()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.dialog = Some(Dialog::ConfirmUnsaved(Pending::Exit));
+        }
         if self.previewing && !self.engine.is_playing() {
             self.previewing = false;
         }
@@ -1992,6 +2273,13 @@ impl eframe::App for AudacityApp {
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        if self.transcript.show_panel {
+            egui::Panel::right("transcript")
+                .resizable(true)
+                .default_size(380.0)
+                .min_size(240.0)
+                .show(ui, |ui| self.transcript_panel(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.tracks_area(ui));
 
         // Show a hint while files are being dragged over the window.
@@ -2015,14 +2303,20 @@ impl eframe::App for AudacityApp {
         self.chains_window(&ctx);
         self.analysis_window(&ctx);
         self.stems_windows(&ctx);
+        self.job_window(&ctx);
+        self.transcribe_windows(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.chains.save(storage);
         self.stems.save(storage);
+        self.save_export_format(storage);
+        self.transcript.save(storage);
+        self.bridge.save(storage);
     }
 
     fn on_exit(&mut self) {
+        self.bridge.shutdown();
         self.engine.stop_recording();
         self.engine.stop_playback();
     }

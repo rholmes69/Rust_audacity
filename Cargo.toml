@@ -2,7 +2,7 @@
 name = "rust_audacity"
 description = "A small Audacity-style audio editor written in Rust"
 license = "MIT"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 default-run = "rust_audacity"
 
@@ -11,7 +11,9 @@ anyhow = "1.0.104"
 cpal = "0.18.2"
 ebur128 = "0.1.10"
 eframe = { version = "0.37.0", features = ["persistence"] }
+flacenc = "0.5"
 hound = "3.5.1"
+mp3lame-encoder = "0.2"
 png = "0.18.1"
 realfft = "3.5.0"
 rfd = "0.17.2"
@@ -19,6 +21,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 symphonia = { version = "0.6.1", features = ["all-codecs", "all-formats"] }
 ureq = { version = "3.4.2", features = ["json"] }
+vorbis_rs = "0.5"
 
 [profile.release]
 opt-level = 3

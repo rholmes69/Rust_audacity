@@ -120,6 +120,11 @@ pub enum StemEvent {
 pub struct CancelHandle(Arc<Mutex<Option<Child>>>);
 
 impl CancelHandle {
+    /// Access the running child process (if any).
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Option<Child>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn cancel(&self) {
         if let Some(c) = self.0.lock().unwrap().as_mut() {
             let _ = c.kill();

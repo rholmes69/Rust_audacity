@@ -26,7 +26,7 @@ async def main():
             print("server:", init.server_info.name, init.server_info.version, "protocol", init.protocol_version)
             tools = await s.list_tools()
             print("tools:", [t.name for t in tools.tools])
-            assert len(tools.tools) == 10
+            assert len(tools.tools) == 21
 
             # Build a problem file: voice-like tone + 60 Hz hum + noise, too quiet.
             assert not (await s.call_tool("generate_audio", {"output": "tone.wav", "kind": "tone", "duration": 6, "frequency": 330, "amplitude": 0.08, "channels": 2})).is_error
