@@ -12,7 +12,8 @@ mod waveform;
 
 // The audio engine lives in the library crate so the MCP server can share it.
 use rust_audacity::{
-    bridge, dsp, effects, envelope, fileio, mcp, project, projectfile, track, transcript, whisper,
+    batch, bridge, dsp, effects, envelope, fileio, labels, mcp, metadata, project, projectfile,
+    track, transcript, whisper,
 };
 
 use std::path::PathBuf;

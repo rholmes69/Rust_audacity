@@ -12,9 +12,66 @@ use std::sync::{
 
 use anyhow::{Result, anyhow};
 use cpal::{
-    FromSample, SampleFormat, SizedSample, Stream, StreamConfig,
+    BufferSize, Device, FromSample, SampleFormat, SizedSample, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use serde::{Deserialize, Serialize};
+
+/// Which audio devices to use (Edit ▸ Preferences ▸ Audio). `None` = system default.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceSettings {
+    pub output: Option<String>,
+    pub input: Option<String>,
+    /// Buffer size in frames (None = driver default). Smaller = lower latency, more CPU.
+    pub buffer_frames: Option<u32>,
+    /// Record one channel (mixing a stereo input down) instead of up to two.
+    pub record_mono: bool,
+}
+
+/// Names of the playback devices on this computer.
+pub fn output_device_names() -> Vec<String> {
+    cpal::default_host()
+        .output_devices()
+        .map(|it| it.map(|d| d.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Names of the recording devices on this computer.
+pub fn input_device_names() -> Vec<String> {
+    cpal::default_host()
+        .input_devices()
+        .map(|it| it.map(|d| d.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Find a device by name, falling back to the default. The string is a warning when the
+/// chosen device wasn't found.
+fn pick(input: bool, wanted: Option<&str>) -> Result<(Device, Option<String>)> {
+    let host = cpal::default_host();
+    if let Some(name) = wanted {
+        let found = if input {
+            host.input_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.to_string() == name))
+        } else {
+            host.output_devices()
+                .ok()
+                .and_then(|mut it| it.find(|d| d.to_string() == name))
+        };
+        if let Some(d) = found {
+            return Ok((d, None));
+        }
+    }
+    let d = if input {
+        host.default_input_device()
+            .ok_or_else(|| anyhow!("no input (microphone) device found"))?
+    } else {
+        host.default_output_device()
+            .ok_or_else(|| anyhow!("no output device found"))?
+    };
+    let warn = wanted.map(|n| format!("“{n}” isn't available; using the default device instead."));
+    Ok((d, warn))
+}
 
 use crate::{envelope::Envelope, project::Project, track::Channel};
 
@@ -28,6 +85,8 @@ pub struct Shared {
     /// Peak meters (f32 bits), reset by the UI after reading.
     pub play_peak: [AtomicU32; 2],
     pub rec_peak: [AtomicU32; 2],
+    /// Input is open only to show levels: captured audio is discarded.
+    pub monitor_only: AtomicBool,
     /// Live (left, right) gain per track index.
     gains: Mutex<Vec<(f32, f32)>>,
 }
@@ -41,6 +100,7 @@ impl Shared {
             looping: AtomicBool::new(false),
             play_peak: [AtomicU32::new(0), AtomicU32::new(0)],
             rec_peak: [AtomicU32::new(0), AtomicU32::new(0)],
+            monitor_only: AtomicBool::new(false),
             gains: Mutex::new(Vec::new()),
         }
     }
@@ -104,6 +164,9 @@ pub struct Engine {
     rec_buf: Arc<Mutex<RecordBuffer>>,
     pub rec_channels: usize,
     pub rec_rate: u32,
+    pub devices: DeviceSettings,
+    /// Set when a chosen device was missing and the default was used.
+    pub device_warning: Option<String>,
 }
 
 impl Default for Engine {
@@ -115,6 +178,8 @@ impl Default for Engine {
             rec_buf: Arc::new(Mutex::new(RecordBuffer::default())),
             rec_channels: 1,
             rec_rate: 44_100,
+            devices: DeviceSettings::default(),
+            device_warning: None,
         }
     }
 }
@@ -154,13 +219,16 @@ impl Engine {
         if start >= end {
             return Err(anyhow!("nothing to play"));
         }
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no output device found"))?;
+        let (device, warn) = pick(false, self.devices.output.as_deref())?;
+        if warn.is_some() {
+            self.device_warning = warn;
+        }
         let supported = device.default_output_config()?;
         let fmt = supported.sample_format();
-        let config: StreamConfig = supported.into();
+        let mut config: StreamConfig = supported.into();
+        if let Some(n) = self.devices.buffer_frames {
+            config.buffer_size = BufferSize::Fixed(n);
+        }
 
         let source = Arc::new(Source {
             tracks: p.tracks.iter().map(|t| t.channels.clone()).collect(),
@@ -179,15 +247,37 @@ impl Engine {
         self.shared.paused.store(false, Ordering::Relaxed);
         self.shared.looping.store(looping, Ordering::Relaxed);
 
-        let stream = match fmt {
-            SampleFormat::F32 => build_output::<f32>(&device, config, source, self.shared.clone()),
-            SampleFormat::F64 => build_output::<f64>(&device, config, source, self.shared.clone()),
-            SampleFormat::I16 => build_output::<i16>(&device, config, source, self.shared.clone()),
-            SampleFormat::I32 => build_output::<i32>(&device, config, source, self.shared.clone()),
-            SampleFormat::U16 => build_output::<u16>(&device, config, source, self.shared.clone()),
-            SampleFormat::I8 => build_output::<i8>(&device, config, source, self.shared.clone()),
-            SampleFormat::U8 => build_output::<u8>(&device, config, source, self.shared.clone()),
+        let build = |config: StreamConfig| match fmt {
+            SampleFormat::F32 => {
+                build_output::<f32>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::F64 => {
+                build_output::<f64>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::I16 => {
+                build_output::<i16>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::I32 => {
+                build_output::<i32>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::U16 => {
+                build_output::<u16>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::I8 => {
+                build_output::<i8>(&device, config, source.clone(), self.shared.clone())
+            }
+            SampleFormat::U8 => {
+                build_output::<u8>(&device, config, source.clone(), self.shared.clone())
+            }
             other => Err(anyhow!("unsupported output sample format {other}")),
+        };
+        // A buffer size the driver doesn't accept falls back to its default.
+        let stream = match build(config) {
+            Err(_) if config.buffer_size != BufferSize::Default => build(StreamConfig {
+                buffer_size: BufferSize::Default,
+                ..config
+            }),
+            r => r,
         }?;
         stream.play()?;
         self.output = Some(stream);
@@ -206,30 +296,63 @@ impl Engine {
         }
     }
 
-    /// Start capturing from the default input device.
+    /// Open the input only to show its level (nothing is recorded).
+    pub fn start_monitor(&mut self) -> Result<()> {
+        self.start_recording()?;
+        self.shared.monitor_only.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn is_monitoring(&self) -> bool {
+        self.input.is_some() && self.shared.monitor_only.load(Ordering::Relaxed)
+    }
+
+    /// Channels a recording will have (after the mono option).
+    pub fn rec_track_channels(&self) -> usize {
+        if self.devices.record_mono {
+            1
+        } else {
+            self.rec_channels.min(2)
+        }
+    }
+
+    /// Start capturing from the chosen (or default) input device.
     pub fn start_recording(&mut self) -> Result<()> {
         self.stop_recording();
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no input (microphone) device found"))?;
+        self.shared.monitor_only.store(false, Ordering::Relaxed);
+        let (device, warn) = pick(true, self.devices.input.as_deref())?;
+        if warn.is_some() {
+            self.device_warning = warn;
+        }
         let supported = device.default_input_config()?;
         let fmt = supported.sample_format();
-        let config: StreamConfig = supported.into();
+        let mut config: StreamConfig = supported.into();
+        if let Some(n) = self.devices.buffer_frames {
+            config.buffer_size = BufferSize::Fixed(n);
+        }
         self.rec_channels = config.channels.max(1) as usize;
         self.rec_rate = config.sample_rate;
         self.rec_buf.lock().unwrap().data.clear();
-        let buf = self.rec_buf.clone();
-        let shared = self.shared.clone();
-        let stream = match fmt {
-            SampleFormat::F32 => build_input::<f32>(&device, config, buf, shared),
-            SampleFormat::F64 => build_input::<f64>(&device, config, buf, shared),
-            SampleFormat::I16 => build_input::<i16>(&device, config, buf, shared),
-            SampleFormat::I32 => build_input::<i32>(&device, config, buf, shared),
-            SampleFormat::U16 => build_input::<u16>(&device, config, buf, shared),
-            SampleFormat::I8 => build_input::<i8>(&device, config, buf, shared),
-            SampleFormat::U8 => build_input::<u8>(&device, config, buf, shared),
-            other => Err(anyhow!("unsupported input sample format {other}")),
+        let build = |config: StreamConfig| {
+            let buf = self.rec_buf.clone();
+            let shared = self.shared.clone();
+            match fmt {
+                SampleFormat::F32 => build_input::<f32>(&device, config, buf, shared),
+                SampleFormat::F64 => build_input::<f64>(&device, config, buf, shared),
+                SampleFormat::I16 => build_input::<i16>(&device, config, buf, shared),
+                SampleFormat::I32 => build_input::<i32>(&device, config, buf, shared),
+                SampleFormat::U16 => build_input::<u16>(&device, config, buf, shared),
+                SampleFormat::I8 => build_input::<i8>(&device, config, buf, shared),
+                SampleFormat::U8 => build_input::<u8>(&device, config, buf, shared),
+                other => Err(anyhow!("unsupported input sample format {other}")),
+            }
+        };
+        let stream = match build(config) {
+            Err(_) if config.buffer_size != BufferSize::Default => build(StreamConfig {
+                buffer_size: BufferSize::Default,
+                ..config
+            }),
+            r => r,
         }?;
         stream.play()?;
         self.input = Some(stream);
@@ -238,12 +361,21 @@ impl Engine {
 
     pub fn stop_recording(&mut self) {
         self.input = None;
+        self.shared.monitor_only.store(false, Ordering::Relaxed);
     }
 
     /// Drain captured audio as planar channels (at `rec_rate`, `rec_channels`, max 2 kept).
     pub fn take_recorded(&self) -> Vec<Vec<f32>> {
         let data = std::mem::take(&mut self.rec_buf.lock().unwrap().data);
         let ch = self.rec_channels;
+        if self.devices.record_mono {
+            let k = 1.0 / ch as f32;
+            return vec![
+                data.chunks_exact(ch)
+                    .map(|f| f.iter().sum::<f32>() * k)
+                    .collect(),
+            ];
+        }
         let keep = ch.min(2);
         let mut out = vec![Vec::with_capacity(data.len() / ch + 1); keep];
         for frame in data.chunks_exact(ch) {
@@ -362,13 +494,18 @@ where
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let mut pk = [0f32; 2];
+            let keep = !shared.monitor_only.load(Ordering::Relaxed);
             let mut guard = buf.lock().unwrap();
-            guard.data.reserve(data.len());
+            if keep {
+                guard.data.reserve(data.len());
+            }
             for (i, s) in data.iter().enumerate() {
                 let v: f32 = s.to_sample::<f32>();
                 let c = (i % ch).min(1);
                 pk[c] = pk[c].max(v.abs());
-                guard.data.push(v);
+                if keep {
+                    guard.data.push(v);
+                }
             }
             drop(guard);
             if ch == 1 {

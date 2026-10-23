@@ -201,6 +201,7 @@ impl AudacityApp {
             "undo": self.project.undo_label(),
             "redo": self.project.redo_label(),
             "transcript": transcript,
+            "labels": self.project.labels.len(),
             "dialog_open": self.dialog.is_some(),
             "dialog_message": match &self.dialog {
                 Some(super::Dialog::Message(m)) => json!(m),
@@ -686,6 +687,114 @@ impl AudacityApp {
                 self.project.push_undo("Envelope");
                 self.project.tracks[i].envelope = crate::envelope::Envelope::from_points(points);
                 Ok(json!({ "index": i, "points": self.project.tracks[i].envelope.points.len() }))
+            }
+            "labels" => {
+                let action = s(a, "action").unwrap_or("list");
+                match action {
+                    "list" => {}
+                    "add" => {
+                        let st = self.to_samples(f(a, "start").ok_or("missing `start` (seconds)")?);
+                        let en = f(a, "end").map_or(st, |t| self.to_samples(t));
+                        let text = s(a, "text").unwrap_or("Label").to_string();
+                        self.project.add_label(st, en, text);
+                    }
+                    "rename" | "delete" => {
+                        let id = a
+                            .get("id")
+                            .and_then(Value::as_u64)
+                            .ok_or("missing label `id` (see action=list)")?;
+                        if !self.project.labels.iter().any(|l| l.id == id) {
+                            return Err(format!("no label with id {id}"));
+                        }
+                        if action == "delete" {
+                            self.delete_label(id);
+                        } else {
+                            let text = s(a, "text").ok_or("missing `text`")?.to_string();
+                            self.project.push_undo("Rename Label");
+                            if let Some(l) = self.project.labels.iter_mut().find(|l| l.id == id) {
+                                l.text = text;
+                            }
+                        }
+                    }
+                    "clear" => {
+                        if !self.project.labels.is_empty() {
+                            self.project.push_undo("Clear Labels");
+                            self.project.labels.clear();
+                        }
+                    }
+                    "export_files" => {
+                        self.require_idle()?;
+                        let dir = PathBuf::from(s(a, "dir").ok_or("missing `dir`")?);
+                        std::fs::create_dir_all(&dir)
+                            .map_err(|e| format!("{}: {e}", dir.display()))?;
+                        let mut fmt = ExportFormat::from_extension(s(a, "format").unwrap_or("mp3"))
+                            .ok_or("format must be wav, flac, mp3 or ogg")?;
+                        if let ExportFormat::Mp3 { kbps } = &mut fmt {
+                            *kbps = f(a, "mp3_kbps").map_or(192, |k| k as u32);
+                        }
+                        let n = self.start_export_many(
+                            dir.clone(),
+                            fmt,
+                            b(a, "include_before_first"),
+                            a.get("numbered").and_then(Value::as_bool).unwrap_or(true),
+                        )?;
+                        return Ok(
+                            json!({ "exporting_files": n, "dir": dir.display().to_string() }),
+                        );
+                    }
+                    o => return Err(format!("unknown action {o}")),
+                }
+                let list: Vec<Value> = self
+                    .project
+                    .labels
+                    .iter()
+                    .map(|l| json!({ "id": l.id, "start": secs(r, l.start), "end": secs(r, l.end), "text": l.text }))
+                    .collect();
+                Ok(json!({ "labels": list }))
+            }
+            "metadata" => {
+                let m = &mut self.project.metadata;
+                let mut changed = false;
+                for (k, slot) in [
+                    ("title", &mut m.title),
+                    ("artist", &mut m.artist),
+                    ("album", &mut m.album),
+                    ("album_artist", &mut m.album_artist),
+                    ("year", &mut m.year),
+                    ("genre", &mut m.genre),
+                    ("track", &mut m.track),
+                    ("comment", &mut m.comment),
+                ] {
+                    if let Some(v) = a.get(k) {
+                        *slot = match v {
+                            Value::String(s) => s.clone(),
+                            Value::Null => String::new(),
+                            other => other.to_string(),
+                        };
+                        changed = true;
+                    }
+                }
+                if let Some(p) = s(a, "cover_path") {
+                    m.cover = Some(
+                        crate::metadata::load_cover(std::path::Path::new(p))
+                            .map_err(|e| format!("{e:#}"))?,
+                    );
+                    changed = true;
+                }
+                if b(a, "remove_cover") {
+                    m.cover = None;
+                    changed = true;
+                }
+                if changed {
+                    self.project.dirty = true;
+                }
+                let m = &self.project.metadata;
+                Ok(json!({
+                    "title": m.title, "artist": m.artist, "album": m.album, "album_artist": m.album_artist,
+                    "year": m.year, "genre": m.genre, "track": m.track, "comment": m.comment,
+                    "cover": m.cover.as_ref().map(|c| json!({ "mime": c.mime, "bytes": c.data.len() })),
+                    "chapters_from_labels": self.project.labels.len(),
+                }))
             }
             "dismiss_dialog" => {
                 let had = self.dialog.take().is_some();

@@ -26,7 +26,7 @@ async def main():
             print("server:", init.server_info.name, init.server_info.version, "protocol", init.protocol_version)
             tools = await s.list_tools()
             print("tools:", [t.name for t in tools.tools])
-            assert len(tools.tools) == 22
+            assert len(tools.tools) == 25
 
             # Build a problem file: voice-like tone + 60 Hz hum + noise, too quiet.
             assert not (await s.call_tool("generate_audio", {"output": "tone.wav", "kind": "tone", "duration": 6, "frequency": 330, "amplitude": 0.08, "channels": 2})).is_error
@@ -57,6 +57,13 @@ async def main():
             show("pitch +5", await s.call_tool("apply_effects", {"input": "song.wav", "effects": [{"effect": "change_pitch", "params": {"semitones": 5}}]}))
             show("bad param", await s.call_tool("apply_effects", {"input": "song.wav", "effects": [{"effect": "compressor", "params": {"ratioo": 4}}]}))
             show("bad effect", await s.call_tool("apply_effects", {"input": "song.wav", "effects": ["autotune"]}))
+
+            # Batch: two files through a chain into a sub-folder as MP3.
+            bp = show("batch_process", await s.call_tool("batch_process", {"inputs": ["problem.wav", "song.wav"], "chain": "podcast", "output_dir": "batch_out", "output_type": "mp3", "suffix": "_clean"}), full=True)
+            assert not bp.is_error and bp.structured_content["processed"] == 2, bp.content[0].text
+            assert os.path.exists(os.path.join(D, "batch_out", "song_clean.mp3"))
+            bad = show("batch outside root", await s.call_tool("batch_process", {"folder": "/"}))
+            assert bad.is_error
 
             show("edit_audio", await s.call_tool("edit_audio", {"input": "fixed.wav", "output": "edited.wav", "operations": [
                 {"op": "remove_silence", "min_duration": 0.5, "keep": 0.2}, {"op": "fade_in", "duration": 0.5}, {"op": "fade_out", "duration": 1},

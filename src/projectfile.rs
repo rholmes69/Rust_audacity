@@ -44,6 +44,10 @@ struct Header {
     /// Word transcript of one track (by index).
     #[serde(default)]
     transcript: Option<TranscriptHeader>,
+    #[serde(default)]
+    labels: Vec<crate::labels::Label>,
+    #[serde(default)]
+    metadata: crate::metadata::Metadata,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +105,8 @@ pub fn save(path: &Path, project: &Project, view: Option<ViewState>) -> Result<(
             })
             .collect(),
         view,
+        labels: project.labels.clone(),
+        metadata: project.metadata.clone(),
         transcript: project.transcript.as_ref().and_then(|t| {
             Some(TranscriptHeader {
                 track: project.transcript_track()?,
@@ -241,6 +247,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
             words: th.words,
         }));
     }
+    project.labels = header.labels;
+    project.metadata = header.metadata;
+    crate::labels::sort(&mut project.labels);
+    // Label ids must not collide with ids handed out later.
+    project.ensure_ids_above(project.labels.iter().map(|l| l.id).max().unwrap_or(0));
     project.dirty = false;
     Ok(Loaded {
         project,
@@ -293,6 +304,8 @@ mod tests {
                 prob: 0.5,
             }],
         }));
+        p.add_label(10, 20, "Verse");
+        p.metadata.title = "My Song".into();
         save(&path, &p, Some(view)).unwrap();
         assert!(!temp_path(&path).exists());
 
@@ -312,6 +325,8 @@ mod tests {
         assert!(q.tracks[1].mute && q.tracks[1].solo && !q.tracks[1].selected);
         assert_eq!(q.tracks[1].view, TrackView::Spectrogram);
         assert_eq!(q.tracks[1].len(), 1234);
+        assert_eq!(q.labels, p.labels);
+        assert_eq!(q.metadata.title, "My Song");
         let tr = q.transcript.as_ref().unwrap();
         assert_eq!(tr.track_id, q.tracks[1].id);
         assert_eq!(tr.words[0].text, "hi");

@@ -1864,6 +1864,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "id3"
+version = "1.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8be496a46468ba3d43690775aa3a79102ce4daf7d99e8072589aae1a3cd955"
+dependencies = [
+ "bitflags 2.13.2",
+ "byteorder",
+ "flate2",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2154,6 +2165,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "metaflac"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdf25a3451319c52a4a56d956475fbbb763bfb8420e2187d802485cb0fd8d965"
+dependencies = [
+ "byteorder",
+ "hex",
 ]
 
 [[package]]
@@ -3267,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "rust_audacity"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "cpal",
@@ -3275,6 +3296,8 @@ dependencies = [
  "eframe",
  "flacenc",
  "hound",
+ "id3",
+ "metaflac",
  "mp3lame-encoder",
  "png",
  "realfft",

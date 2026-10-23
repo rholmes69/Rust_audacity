@@ -851,6 +851,7 @@ impl JobResult {
         {
             return false;
         }
+        let n_tracks = self.tracks.len();
         p.push_undo(self.label);
         for t in self.tracks {
             if let Some(idx) = p.tracks.iter().position(|o| o.id == t.id) {
@@ -865,6 +866,10 @@ impl JobResult {
             }
         }
         if let Some(sel) = self.selection {
+            // Stretching every track moves the labels with the audio.
+            if self.changes_length && n_tracks == p.tracks.len() {
+                p.retime_labels(self.start, self.end, sel.end);
+            }
             p.selection = sel;
         }
         true

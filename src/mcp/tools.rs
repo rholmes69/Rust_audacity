@@ -27,7 +27,7 @@ pub struct Output {
     pub png: Option<Vec<u8>>,
 }
 
-const TOOL_NAMES: [&str; 11] = [
+const TOOL_NAMES: [&str; 12] = [
     "transcribe_audio",
     "audio_info",
     "analyze_audio",
@@ -39,6 +39,7 @@ const TOOL_NAMES: [&str; 11] = [
     "generate_audio",
     "separate_stems",
     "render_spectrogram",
+    "batch_process",
 ];
 
 pub fn exists(name: &str) -> bool {
@@ -152,6 +153,32 @@ pub fn definitions() -> Vec<Value> {
                 "overwrite": { "type": "boolean", "description": "Allow writing over the input file (default false)." },
             })),
             &["input"],
+            false,
+            false,
+        ),
+        tool(
+            "batch_process",
+            "Batch process",
+            "Run the same effects (a built-in chain and/or a list of effects) over many audio files and export each one, like File ▸ Batch Process in the app. \
+             Give `inputs` (files) and/or `folder` (every audio file in it). Outputs are named <name><suffix>.<output_type>, next to each input or in output_dir; \
+             existing files are kept and the new one numbered unless overwrite=true. With no effects the files are just converted. \
+             noise_reduction takes its profile from each file's quietest half-second. Returns before/after loudness per file.",
+            json!({
+                "inputs": { "type": "array", "items": { "type": "string" }, "description": "Audio files to process." },
+                "folder": p_path("Process every audio file in this folder."),
+                "recursive": { "type": "boolean", "description": "With folder: include sub-folders (default false)." },
+                "chain": { "type": "string", "description": "Name of a built-in chain from list_effects (e.g. \"Podcast Voice\"). Applied before `effects`." },
+                "effects": { "type": "array", "items": effect_item, "description": "Effects to apply in order." },
+                "output_dir": p_path("Folder for the outputs (default: next to each input)."),
+                "output_type": { "type": "string", "enum": ["wav", "flac", "mp3", "ogg"], "description": "Output file type (default wav)." },
+                "suffix": { "type": "string", "description": "Added to each file name (default \"_processed\")." },
+                "overwrite": { "type": "boolean", "description": "Replace existing outputs instead of numbering new ones (default false). Inputs are never overwritten." },
+                "title_from_file": { "type": "boolean", "description": "Set the title tag to the file name (default true)." },
+                "format": p_format(),
+                "mp3_kbps": { "type": "integer", "enum": [64, 96, 128, 160, 192, 224, 256, 320], "description": "Bitrate for mp3 output (default 192)." },
+                "ogg_quality": { "type": "integer", "minimum": 0, "maximum": 10, "description": "Quality for ogg output, 0 (small) to 10 (best); default 6." },
+            }),
+            &[],
             false,
             false,
         ),
@@ -340,6 +367,7 @@ pub fn call(
         "generate_audio" => generate_audio(args, cfg),
         "separate_stems" => separate_stems(args, cfg, progress, cancel),
         "render_spectrogram" => render_spectrogram(args, cfg),
+        "batch_process" => batch_process(args, cfg, progress),
         _ => Err(format!("unknown tool {name}")),
     }
 }
@@ -1195,10 +1223,8 @@ fn auto_noise_range(m: &[f32], rate: u32) -> Option<(usize, usize)> {
     best.map(|(_, i)| (i, i + win))
 }
 
-fn apply_effects(args: &Value, cfg: &Config, progress: &Progress) -> R<Output> {
-    let input = input_path(cfg, req_str(args, "input")?)?;
-    let out = out_for(cfg, args, &input, "_processed", "wav")?;
-    let fmt = wav_format(args)?;
+/// The effects requested by `chain` (a built-in chain name) followed by `effects`.
+fn effect_steps(args: &Value, require: bool) -> R<Vec<Effect>> {
     let mut steps: Vec<Effect> = Vec::new();
     if let Some(chain) = s(args, "chain") {
         let c = builtin_chains()
@@ -1222,9 +1248,139 @@ fn apply_effects(args: &Value, cfg: &Config, progress: &Progress) -> R<Output> {
             steps.push(parse_effect(spec).map_err(|e| format!("effects[{i}]: {e}"))?);
         }
     }
-    if steps.is_empty() {
+    if steps.is_empty() && require {
         return Err("nothing to do: pass `effects` and/or `chain` (see list_effects)".into());
     }
+    Ok(steps)
+}
+
+fn batch_process(args: &Value, cfg: &Config, progress: &Progress) -> R<Output> {
+    let steps = effect_steps(args, false)?;
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    if let Some(list) = args.get("inputs") {
+        for v in list
+            .as_array()
+            .ok_or("`inputs` must be an array of paths")?
+        {
+            inputs.push(input_path(
+                cfg,
+                v.as_str().ok_or("`inputs` must be an array of paths")?,
+            )?);
+        }
+    }
+    if let Some(dir) = s(args, "folder") {
+        let d = absolutize(cfg, dir);
+        let d =
+            std::fs::canonicalize(&d).map_err(|e| format!("cannot open {}: {e}", d.display()))?;
+        check_root(cfg, &d)?;
+        if !d.is_dir() {
+            return Err(format!("{} is not a folder", d.display()));
+        }
+        for f in crate::batch::audio_files_in(&d, b(args, "recursive")) {
+            if !inputs.contains(&f) {
+                inputs.push(f);
+            }
+        }
+    }
+    if inputs.is_empty() {
+        return Err("no audio files: pass `inputs` and/or `folder`".into());
+    }
+    let ext = s(args, "output_type").unwrap_or("wav");
+    let fmt = wav_format(args)?.for_path(Path::new(&format!("x.{ext}")));
+    let out_dir = match s(args, "output_dir") {
+        Some(d) => Some(
+            output_path(
+                cfg,
+                &Path::new(d).join("placeholder.wav").to_string_lossy(),
+                "wav",
+            )?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("invalid output_dir")?,
+        ),
+        None => None,
+    };
+    let settings = crate::batch::BatchSettings {
+        chain: steps.clone(),
+        format: fmt,
+        out_dir,
+        suffix: s(args, "suffix").unwrap_or("_processed").to_string(),
+        overwrite: b(args, "overwrite"),
+        meta: None,
+        title_from_file: args
+            .get("title_from_file")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    };
+    let total = inputs.len() as f64;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let results = crate::batch::run(
+        &inputs,
+        &settings,
+        &cancel,
+        |i, _, p| {
+            progress.report(
+                i as f64,
+                Some(total),
+                &p.file_name().unwrap_or_default().to_string_lossy(),
+            );
+        },
+        |_| {},
+    );
+    progress.report(total, Some(total), "done");
+    let ok = results.iter().filter(|r| r.error.is_none()).count();
+    let files: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "input": r.input.display().to_string(),
+                "output": r.output.as_ref().map(|o| o.display().to_string()),
+                "error": r.error,
+                "lufs_before": r.lufs_before.map(round3),
+                "lufs_after": r.lufs_after.map(round3),
+                "peak_after_db": db(r.peak_after_db),
+                "seconds": round3(r.secs as f64),
+            })
+        })
+        .collect();
+    let applied: Vec<String> = steps.iter().map(effect_id).collect();
+    let mut text = format!(
+        "Processed {ok} of {} file(s){}\n",
+        results.len(),
+        if applied.is_empty() {
+            " (convert only)".to_string()
+        } else {
+            format!(" with {}", applied.join(" → "))
+        }
+    );
+    for r in &results {
+        match (&r.output, &r.error) {
+            (Some(o), _) => text.push_str(&format!(
+                "✓ {} → {}{}\n",
+                r.input.display(),
+                o.display(),
+                r.lufs_after
+                    .map_or(String::new(), |l| format!(" ({l:.1} LUFS)"))
+            )),
+            (None, e) => text.push_str(&format!(
+                "✗ {}: {}\n",
+                r.input.display(),
+                e.clone().unwrap_or_default()
+            )),
+        }
+    }
+    Ok(Output {
+        text,
+        data: json!({ "processed": ok, "failed": results.len() - ok, "applied": applied, "files": files }),
+        png: None,
+    })
+}
+
+fn apply_effects(args: &Value, cfg: &Config, progress: &Progress) -> R<Output> {
+    let input = input_path(cfg, req_str(args, "input")?)?;
+    let out = out_for(cfg, args, &input, "_processed", "wav")?;
+    let fmt = wav_format(args)?;
+    let steps = effect_steps(args, true)?;
     let a = load(&input)?;
     let before = analysis::measure(&a.chans, a.rate);
     let (start, end) = range(args, a.rate, a.len())?;

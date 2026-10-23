@@ -15,7 +15,7 @@ This produces `target\release\rust_audacity_mcp.exe`. Running `cargo build --rel
 
 ## Built into the app (HTTP), the easiest way
 
-While Rust Audacity is open, it serves the same 22 tools over **Streamable HTTP** at
+While Rust Audacity is open, it serves the same 25 tools over **Streamable HTTP** at
 
 ```
 http://127.0.0.1:8765/mcp
@@ -101,6 +101,7 @@ Use the same command and args in the client's MCP settings. The transport is **s
 | `generate_audio` | Tone (sine/square/saw/triangle), noise (white/pink/brown) or silence. |
 | `separate_stems` | Split a song into stems as WAV files. `engine: "demucs"` gives 4 stems (vocals/drums/bass/other), 6 stems with `htdemucs_6s`, or 2 stems with `two_stems`; it needs `pip install -U demucs`, reports progress and can be cancelled. `engine: "builtin"` gives an instant vocals + instrumental split with nothing to install. |
 | `render_spectrogram` | Saves a PNG spectrogram and returns it as an image the agent can look at. |
+| `batch_process` | Run a chain and/or effects over many files (`inputs` and/or a `folder`, optionally `recursive`) and export each as WAV/FLAC/MP3/Ogg (`output_type`), next to the inputs or in `output_dir`, named `<name><suffix>`. With no effects it just converts. Reports loudness per file and progress. |
 | `transcribe_audio` | Speech-to-text with Whisper. Returns text plus `[start, end, word]` timings, and can write `.srt`, `.txt` or `.json`. Needs `pip install -U faster-whisper`. |
 
 ### Tools for the open app window
@@ -120,6 +121,8 @@ These tools need the Rust Audacity app to be running (Agents ▸ "Allow AI agent
 | `app_export` | Export the mix or the selection; the format comes from the extension. |
 | `app_save_project` | Save as `.rap`. |
 | `app_transcript` | `transcribe` (Whisper), `get` (words with indices and times), `delete_words` (cut words by index), `remove_fillers`, `show`. |
+| `app_labels` | `list`, `add` (point or region, seconds), `rename`, `delete`, `clear`, `export_files` (one audio file per label into a folder). Labels become chapters on export. |
+| `app_metadata` | Set title, artist, album, album artist, year, genre, track, comment and cover art (`cover_path`, or `remove_cover`). Written into every export. |
 
 Inputs are never modified: results go to a new file (default `<name>_processed.wav` and similar). Writing over the input requires `overwrite: true`.
 

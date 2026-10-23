@@ -45,6 +45,7 @@ struct Snapshot {
     tracks: Vec<Track>,
     selection: Selection,
     transcript: Option<Arc<Transcript>>,
+    labels: Vec<crate::labels::Label>,
     label: String,
 }
 
@@ -70,6 +71,10 @@ pub struct Project {
     pub noise_profile: Option<crate::dsp::denoise::NoiseProfile>,
     /// Word-level transcript of one track (part of undo history).
     pub transcript: Option<Arc<Transcript>>,
+    /// Named points / regions on the timeline (part of undo history).
+    pub labels: Vec<crate::labels::Label>,
+    /// Title, artist, cover art… written into exported files (not part of undo).
+    pub metadata: crate::metadata::Metadata,
 }
 
 impl Default for Project {
@@ -86,11 +91,18 @@ impl Default for Project {
             dirty: false,
             noise_profile: None,
             transcript: None,
+            labels: Vec::new(),
+            metadata: Default::default(),
         }
     }
 }
 
 impl Project {
+    /// Make sure future ids are larger than `id`.
+    pub fn ensure_ids_above(&mut self, id: u64) {
+        self.next_id = self.next_id.max(id + 1);
+    }
+
     pub fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -114,6 +126,7 @@ impl Project {
             tracks: self.tracks.clone(),
             selection: self.selection,
             transcript: self.transcript.clone(),
+            labels: self.labels.clone(),
             label: label.into(),
         });
         if self.undo.len() > MAX_UNDO {
@@ -149,6 +162,7 @@ impl Project {
             tracks: std::mem::replace(&mut self.tracks, snap.tracks),
             selection: self.selection,
             transcript: std::mem::replace(&mut self.transcript, snap.transcript),
+            labels: std::mem::replace(&mut self.labels, snap.labels),
             label: snap.label,
         };
         self.selection = snap.selection;
@@ -170,6 +184,7 @@ impl Project {
             tracks: std::mem::replace(&mut self.tracks, snap.tracks),
             selection: self.selection,
             transcript: std::mem::replace(&mut self.transcript, snap.transcript),
+            labels: std::mem::replace(&mut self.labels, snap.labels),
             label: snap.label,
         };
         self.selection = snap.selection;
@@ -224,6 +239,7 @@ impl Project {
         } else {
             vec![tt]
         };
+        let all = self.all_tracks(&targets);
         for &(s, e) in ranges.iter().rev() {
             for &i in &targets {
                 let len = self.tracks[i].len();
@@ -232,9 +248,51 @@ impl Project {
                     self.retime_transcript(i, s, e.min(len), s);
                 }
             }
+            if all {
+                self.retime_labels(s, e, s);
+            }
         }
         self.selection = Selection::cursor(ranges[0].0);
         true
+    }
+
+    // ----- labels --------------------------------------------------------------
+
+    /// True if `targets` covers every track (then edits move the labels too).
+    fn all_tracks(&self, targets: &[usize]) -> bool {
+        !self.tracks.is_empty() && targets.len() == self.tracks.len()
+    }
+
+    /// Move labels for an edit applied to every track.
+    pub fn retime_labels(&mut self, start: usize, old_end: usize, new_end: usize) {
+        crate::labels::retime(&mut self.labels, start, old_end, new_end);
+    }
+
+    /// Add a label (one undo step). Returns its id.
+    pub fn add_label(&mut self, start: usize, end: usize, text: impl Into<String>) -> u64 {
+        self.push_undo("Add Label");
+        let id = self.alloc_id();
+        self.labels.push(crate::labels::Label {
+            id,
+            start: start.min(end),
+            end: start.max(end),
+            text: text.into(),
+        });
+        crate::labels::sort(&mut self.labels);
+        id
+    }
+
+    /// Chapters for export: one per label, back to back (see `labels::chapter_spans`).
+    pub fn chapters(&self) -> Vec<crate::metadata::Chapter> {
+        let ms = |s: usize| (s as f64 * 1000.0 / self.rate.max(1) as f64).round() as u32;
+        crate::labels::chapter_spans(&self.labels, self.len())
+            .into_iter()
+            .map(|(s, e, t)| crate::metadata::Chapter {
+                start_ms: ms(s),
+                end_ms: ms(e),
+                title: t,
+            })
+            .collect()
     }
 
     // ----- auto-ducking -------------------------------------------------------
@@ -375,7 +433,11 @@ impl Project {
 
     fn delete_range(&mut self) {
         let Selection { start, end } = self.selection;
-        for i in self.target_tracks() {
+        let targets = self.target_tracks();
+        if self.all_tracks(&targets) {
+            self.retime_labels(start, end, start);
+        }
+        for i in targets {
             let e = end.min(self.tracks[i].len());
             self.tracks[i].remove(start, end);
             if e > start {
@@ -421,6 +483,9 @@ impl Project {
                 self.tracks[idx].selected = true;
             }
         }
+        if self.all_tracks(&targets) && clips.len() >= targets.len() {
+            self.retime_labels(start, end, start + pasted_len);
+        }
         self.selection = Selection::new(start, start + pasted_len);
         true
     }
@@ -444,7 +509,13 @@ impl Project {
         }
         self.push_undo("Trim Audio");
         let Selection { start, end } = self.selection;
-        for i in self.target_tracks() {
+        let targets = self.target_tracks();
+        if self.all_tracks(&targets) {
+            let len = self.len();
+            self.retime_labels(end.min(len), len, end.min(len));
+            self.retime_labels(0, start.min(len), 0);
+        }
+        for i in targets {
             let t = &mut self.tracks[i];
             let len = t.len();
             t.remove(end.min(len), len);
@@ -847,6 +918,35 @@ mod tests {
         assert!(p.undo());
         assert!(p.tracks[1].envelope.is_empty());
         assert!(p.auto_duck(0, &[0], &params, false).is_err());
+    }
+
+    #[test]
+    fn labels_follow_edits_to_all_tracks_and_undo() {
+        let mut p = Project {
+            rate: 1000,
+            ..Default::default()
+        };
+        p.add_track("a", vec![vec![0.1; 10_000]]);
+        p.add_track("b", vec![vec![0.2; 10_000]]);
+        p.add_label(1000, 1000, "One");
+        p.add_label(5000, 6000, "Two");
+        // Deleting on every track moves later labels.
+        p.select_all();
+        p.selection = Selection::new(2000, 3000);
+        assert!(p.delete());
+        assert_eq!((p.labels[1].start, p.labels[1].end), (4000, 5000));
+        // Deleting on one track only leaves labels alone.
+        p.tracks[1].selected = false;
+        p.selection = Selection::new(0, 500);
+        assert!(p.delete());
+        assert_eq!(p.labels[0].start, 1000);
+        let ch = p.chapters();
+        assert_eq!(ch.len(), 2);
+        assert_eq!((ch[0].start_ms, ch[0].title.as_str()), (1000, "One"));
+        assert!(p.undo() && p.undo());
+        assert_eq!(p.labels[1].start, 5000);
+        assert!(p.undo() && p.undo());
+        assert!(p.labels.is_empty());
     }
 
     #[test]

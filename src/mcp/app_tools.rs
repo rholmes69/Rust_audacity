@@ -15,7 +15,9 @@ use super::{
     tools::{Output, R, b, f, input_path, norm, output_path, parse_effect, req_str, s},
 };
 
-pub const NAMES: [&str; 11] = [
+pub const NAMES: [&str; 13] = [
+    "app_labels",
+    "app_metadata",
     "app_auto_duck",
     "app_status",
     "app_open",
@@ -143,6 +145,43 @@ pub fn definitions() -> Vec<Value> {
                 "fade_up_ms": secs("Fade-up time (default 700)."),
                 "hold_ms": secs("Stay down through pauses shorter than this (default 800)."),
                 "use_transcript": { "type": "boolean", "description": "Use transcript words if available (default true)." },
+            }),
+            &[],
+            false,
+        ),
+        tool(
+            "app_labels",
+            "Rust Audacity window: labels",
+            "Labels mark points or regions on the timeline (chapters, songs, segments). action=list returns them with ids; \
+             add (start, optional end for a region, text); rename (id, text); delete (id); clear; export_files writes each \
+             label's audio as its own file into `dir` (`format`: wav/flac/mp3/ogg), tagged with title = label and track numbers. \
+             Point labels split the audio from one label to the next. Labels are also written as chapters by app_export.",
+            json!({
+                "action": { "type": "string", "enum": ["list", "add", "rename", "delete", "clear", "export_files"] },
+                "start": secs("add: start in seconds."),
+                "end": secs("add: end in seconds (omit for a point label)."),
+                "text": { "type": "string" },
+                "id": { "type": "integer" },
+                "dir": { "type": "string", "description": "export_files: output folder." },
+                "format": { "type": "string", "enum": ["wav", "flac", "mp3", "ogg"] },
+                "mp3_kbps": { "type": "integer" },
+                "include_before_first": { "type": "boolean", "description": "export_files: also export audio before the first point label." },
+                "numbered": { "type": "boolean", "description": "export_files: prefix file names with 01, 02… (default true)." },
+            }),
+            &["action"],
+            false,
+        ),
+        tool(
+            "app_metadata",
+            "Rust Audacity window: metadata",
+            "Get or set the project's metadata (written into exported files): title, artist, album, album_artist, year, genre, \
+             track (\"3\" or \"3/12\"), comment, and cover art from a PNG/JPEG file (cover_path). Call with no arguments to read it.",
+            json!({
+                "title": { "type": "string" }, "artist": { "type": "string" }, "album": { "type": "string" },
+                "album_artist": { "type": "string" }, "year": { "type": "string" }, "genre": { "type": "string" },
+                "track": { "type": "string" }, "comment": { "type": "string" },
+                "cover_path": { "type": "string", "description": "PNG or JPEG image to use as cover art." },
+                "remove_cover": { "type": "boolean" },
             }),
             &[],
             false,
@@ -416,6 +455,64 @@ pub fn call(name: &str, args: &Value, cfg: &Config, progress: &Progress) -> R<Ou
             }
             let r = c.call("track", a)?;
             out(format!("Track updated: {r}"), r)
+        }
+        "app_labels" => {
+            let mut a = args.clone();
+            if let Some(d) = s(args, "dir") {
+                a["dir"] = json!(
+                    output_path(cfg, &format!("{d}/x"), "x")?
+                        .parent()
+                        .map(|p| p.display().to_string())
+                );
+            }
+            let r = c.call("labels", a)?;
+            if r.get("exporting_files").is_some() {
+                let st = wait_idle(&mut c, progress, "Export", Duration::from_secs(3600))?;
+                return out(
+                    format!(
+                        "Exported {} file(s) to {}. {}",
+                        r["exporting_files"],
+                        r["dir"].as_str().unwrap_or(""),
+                        st["status_message"].as_str().unwrap_or("")
+                    ),
+                    r,
+                );
+            }
+            let list = r["labels"].as_array().cloned().unwrap_or_default();
+            let lines: Vec<String> = list
+                .iter()
+                .map(|l| {
+                    let (st, en) = (
+                        l["start"].as_f64().unwrap_or(0.0),
+                        l["end"].as_f64().unwrap_or(0.0),
+                    );
+                    if (en - st).abs() < 1e-9 {
+                        format!(
+                            "  id {}: {:.3}s “{}”",
+                            l["id"],
+                            st,
+                            l["text"].as_str().unwrap_or("")
+                        )
+                    } else {
+                        format!(
+                            "  id {}: {:.3}–{:.3}s “{}”",
+                            l["id"],
+                            st,
+                            en,
+                            l["text"].as_str().unwrap_or("")
+                        )
+                    }
+                })
+                .collect();
+            out(format!("{} label(s):\n{}", list.len(), lines.join("\n")), r)
+        }
+        "app_metadata" => {
+            let mut a = args.clone();
+            if let Some(p) = s(args, "cover_path") {
+                a["cover_path"] = json!(input_path(cfg, p)?.display().to_string());
+            }
+            let r = c.call("metadata", a)?;
+            out(format!("Project metadata: {r}"), r)
         }
         "app_auto_duck" => {
             let r = c.call("auto_duck", args.clone())?;

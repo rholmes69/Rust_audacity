@@ -54,7 +54,7 @@ On Linux you also need `libasound2-dev`, `libgtk-3-dev`, `libxkbcommon-dev` and 
   - MP3: 64–320 kbps constant bitrate.
   - Ogg Vorbis: quality 0–10.
 
-  Export runs in the background and remembers your last format.
+  Export runs in the background and remembers your last format. Title, artist, album, cover art and chapters (from labels) are written into MP3, FLAC, Ogg and WAV files; untick "Tags" in the Export dialog to leave them out.
 - **Effects run in the background.** A progress window with **Cancel** appears for anything that takes more than a moment, and the window stays responsive.
 - **Time Shift tool (F5, ↔ button):**
   - Drag a track left or right to move it in time. It never cuts audio: moving left only removes leading silence.
@@ -65,6 +65,29 @@ On Linux you also need `libasound2-dev`, `libgtk-3-dev`, `libxkbcommon-dev` and 
 - **Recording:** records from the microphone, with overdub.
 - **Editing:** cut, copy, paste, delete, silence, trim, duplicate and split, with 100-step undo.
 - **Tracks:** multiple tracks with gain, pan, mute and solo.
+- **Audio devices (Edit ▸ Preferences, Ctrl+P):** choose the playback and recording device, mono or stereo recording and the buffer size (lower = less latency). **Monitor input** shows your microphone level without recording so you can set your gain, and **Test playback** plays a short tone. If a saved device is unplugged, the system default is used and you're told.
+
+### Labels and chapters
+
+- **Add a label:** Ctrl+B (or Edit ▸ Add Label at Selection) labels the cursor position or the selected region, and lets you type its name. Labels appear in a strip under the ruler.
+- **Edit labels:** drag a label to move it, drag a region's edges to resize it, click it to select its audio, double-click to rename. Right-click to play or delete it. Labels move with cuts, pastes and effects that change the length, and undo with everything else.
+- **Labels window (Ctrl+Shift+B):** a table of all labels, with import and export of Audacity label files (`.txt`).
+- **Export audio per label:** writes one file per label (a point label runs to the next label), optionally numbered and with the part before the first label as "Start". Each file gets the label as its title and a track number.
+- **Chapters:** when you export, each label becomes a chapter (ID3 CHAP for MP3, Vorbis CHAPTER comments for FLAC/Ogg), so podcast players can skip between sections.
+
+### Metadata (File ▸ Metadata…)
+
+Set the title, artist, album, album artist, year, genre, track number, comment and cover art (JPEG or PNG). They're saved with the project and written into every export.
+
+### Batch processing (File ▸ Batch Process…)
+
+Run the same effect chain over many files at once, for example to clean up and level a whole season of podcast episodes:
+
+1. Add files, or a whole folder (optionally with sub-folders).
+2. Pick a chain (or "Nothing" to just convert), the output format and where to save. Each output is named after its input plus a suffix such as `_processed`.
+3. Click **Process**. It runs in the background, so you can keep editing; the results list shows each file's loudness afterwards, and any failures.
+
+Noise reduction takes its noise profile from each file's quietest half-second. Existing files are never overwritten unless you tick the option, and inputs are never touched.
 
 ### Audio enhancement (20 features)
 
@@ -193,7 +216,7 @@ While the app is open, AI agents connected through the Rust Audacity MCP server 
 
 ## Use it from AI agents (MCP server)
 
-Rust Audacity has a Model Context Protocol server with 22 tools. AI agents can use it to analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. With the `app_*` tools they can also drive the open window. The server comes in two forms, with exactly the same tools:
+Rust Audacity has a Model Context Protocol server with 25 tools. AI agents can use it to analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. With the `app_*` tools they can also drive the open window. The server comes in two forms, with exactly the same tools:
 
 - **Built into the app (HTTP).** It runs whenever Rust Audacity is open, at `http://127.0.0.1:8765/mcp`.
   - **Agents ▸ MCP Server Settings & Setup…** shows the address and the access token, and lets you limit agents to one folder.
@@ -223,6 +246,8 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 | Ctrl+Shift+I / Ctrl+Shift+E | Import audio / Export audio |
 | F1 / F2 / F5 | Selection / Envelope / Time Shift tool |
 | Ctrl+Shift+T | Show / hide the transcript panel |
+| Ctrl+B / Ctrl+Shift+B | Add label / Labels window |
+| Ctrl+P | Preferences (audio devices) |
 
 ## Code layout
 
@@ -246,6 +271,13 @@ src/
     http.rs          Streamable HTTP transport (localhost, token, Host/Origin checks)
     tools.rs         file tools; app_tools.rs = app_* tools
   app/envelope_ui.rs Envelope tool, envelope drawing, Auto Duck dialog
+  app/prefs_ui.rs    Preferences: audio devices, buffer size, input monitor
+  app/labels_ui.rs   label strip, Labels window, export per label
+  app/meta_ui.rs     Metadata window (tags, cover art)
+  app/batch_ui.rs    Batch Process window
+  labels.rs          labels that follow edits, export regions, chapters, Audacity .txt
+  metadata.rs        tags, cover art and chapters for MP3 (ID3), FLAC, Ogg and WAV
+  batch.rs           batch engine shared by the app and the batch_process MCP tool
   projectfile.rs     .rap project file format (save/load)
   envelope.rs        volume envelope points (interpolation, follow edits)
   transcript.rs      word timings that follow edits, fillers, SRT/TXT
@@ -266,13 +298,14 @@ src/
     analysis.rs      LUFS/LRA/true-peak, spectrum
     separation.rs    built-in centre extraction, Demucs runner
     duck.rs          speech detection and ducking envelopes
-.github/workflows/   CI (build/test/clippy on Windows + Linux) and tag-triggered releases
   project.rs         tracks, selection, undo, edits, time shift
   fileio.rs          import (Symphonia) and WAV/FLAC/MP3/Ogg export
-  track.rs, engine.rs, waveform.rs
+  engine.rs          playback/recording with device selection
+  track.rs, waveform.rs
+.github/workflows/   CI (build/test/clippy on Windows + Linux) and tag-triggered releases
 ```
 
-Run `cargo test` to run the 71 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), the agent bridge round-trips and rejects wrong tokens, envelopes follow edits, Auto Duck lowers music only while speech is present, and the HTTP MCP server enforces its token and rejects requests from web pages.
+Run `cargo test` to run the 77 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), the agent bridge round-trips and rejects wrong tokens, envelopes follow edits, Auto Duck lowers music only while speech is present, the HTTP MCP server enforces its token and rejects requests from web pages, labels follow edits and undo, tags/cover/chapters read back correctly from all four export formats, and batch processing levels every file.
 
 ## Known limitations
 

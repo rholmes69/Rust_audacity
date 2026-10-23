@@ -55,7 +55,7 @@ impl ChainsState {
         self.last_params.push(*fx);
     }
 
-    fn all(&self) -> Vec<(EffectChain, bool)> {
+    pub(super) fn all(&self) -> Vec<(EffectChain, bool)> {
         builtin_chains()
             .into_iter()
             .map(|c| (c, true))

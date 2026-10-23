@@ -2,7 +2,7 @@
 name = "rust_audacity"
 description = "A small Audacity-style audio editor written in Rust"
 license = "MIT"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 default-run = "rust_audacity"
 
@@ -13,6 +13,7 @@ ebur128 = "0.1.10"
 eframe = { version = "0.37.0", features = ["persistence"] }
 flacenc = "0.5"
 hound = "3.5.1"
+id3 = "1"
 mp3lame-encoder = "0.2"
 png = "0.18.1"
 realfft = "3.5.0"
@@ -34,6 +35,9 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[dev-dependencies]
+metaflac = "0.2"
 
 [build-dependencies]
 winresource = "0.1.34"

@@ -280,19 +280,69 @@ impl ExportFormat {
 
 /// Write planar audio in any supported format.
 pub fn export(path: &Path, channels: &[Vec<f32>], rate: u32, fmt: ExportFormat) -> Result<()> {
+    export_tagged(path, channels, rate, fmt, None, &[])
+}
+
+/// Export with metadata (title, artist, cover…) and chapters where the format supports them.
+pub fn export_tagged(
+    path: &Path,
+    channels: &[Vec<f32>],
+    rate: u32,
+    fmt: ExportFormat,
+    meta: Option<&crate::metadata::Metadata>,
+    chapters: &[crate::metadata::Chapter],
+) -> Result<()> {
+    use crate::metadata;
     if channels.is_empty() || channels[0].is_empty() {
         bail!("nothing to export");
     }
+    let empty = metadata::Metadata::default();
+    let tagging = meta.is_some_and(|m| !m.is_empty()) || !chapters.is_empty();
+    let m = meta.unwrap_or(&empty);
     match fmt {
-        ExportFormat::Wav(w) => export_wav(path, channels, rate, w),
-        ExportFormat::Flac { bits } => export_flac(path, channels, rate, bits),
-        ExportFormat::Mp3 { kbps } => export_mp3(path, channels, rate, kbps),
-        ExportFormat::Ogg { quality } => export_ogg(path, channels, rate, quality),
+        ExportFormat::Wav(w) => {
+            export_wav(path, channels, rate, w)?;
+            if tagging {
+                metadata::tag_wav(path, m)?;
+            }
+            Ok(())
+        }
+        ExportFormat::Flac { bits } => {
+            let mut bytes = encode_flac(channels, rate, bits)?;
+            if tagging {
+                metadata::tag_flac_bytes(&mut bytes, m, chapters)?;
+            }
+            std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))
+        }
+        ExportFormat::Mp3 { kbps } => {
+            let audio = encode_mp3(channels, rate, kbps)?;
+            let mut out = if tagging {
+                metadata::id3_tag(m, chapters)?
+            } else {
+                Vec::new()
+            };
+            out.extend_from_slice(&audio);
+            std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))
+        }
+        ExportFormat::Ogg { quality } => {
+            let comments = if tagging {
+                metadata::ogg_comments(m, chapters)
+            } else {
+                Vec::new()
+            };
+            write_ogg(path, channels, rate, quality, &comments)
+        }
     }
 }
 
 /// Lossless FLAC (16-bit is dithered, 24-bit is rounded).
 pub fn export_flac(path: &Path, channels: &[Vec<f32>], rate: u32, bits: u8) -> Result<()> {
+    let bytes = encode_flac(channels, rate, bits)?;
+    std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// FLAC stream bytes (no tags).
+fn encode_flac(channels: &[Vec<f32>], rate: u32, bits: u8) -> Result<Vec<u8>> {
     use flacenc::{component::BitRepr, error::Verify};
     let bits: usize = if bits >= 24 { 24 } else { 16 };
     let nch = channels.len().min(8);
@@ -329,7 +379,7 @@ pub fn export_flac(path: &Path, channels: &[Vec<f32>], rate: u32, bits: u8) -> R
         let m = bytes[max].to_vec();
         bytes[min].copy_from_slice(&m);
     }
-    std::fs::write(path, &bytes).with_context(|| format!("writing {}", path.display()))
+    Ok(bytes)
 }
 
 /// Sample rates LAME can write directly.
@@ -337,6 +387,12 @@ const MP3_RATES: [u32; 9] = [8000, 11025, 12000, 16000, 22050, 24000, 32000, 441
 
 /// Constant-bitrate MP3 via LAME.
 pub fn export_mp3(path: &Path, channels: &[Vec<f32>], rate: u32, kbps: u32) -> Result<()> {
+    let out = encode_mp3(channels, rate, kbps)?;
+    std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))
+}
+
+/// MP3 bitstream (no tags).
+fn encode_mp3(channels: &[Vec<f32>], rate: u32, kbps: u32) -> Result<Vec<u8>> {
     use mp3lame_encoder::{Bitrate, Builder, DualPcm, FlushNoGap, MonoPcm, Quality};
     // MP3 only supports a fixed set of rates: resample anything else to the nearest one above.
     let out_rate = if MP3_RATES.contains(&rate) {
@@ -408,11 +464,21 @@ pub fn export_mp3(path: &Path, channels: &[Vec<f32>], rate: u32, kbps: u32) -> R
     out.reserve(7200);
     enc.flush_to_vec::<FlushNoGap>(&mut out)
         .map_err(|e| lame_err("flush", &e))?;
-    std::fs::write(path, &out).with_context(|| format!("writing {}", path.display()))
+    Ok(out)
 }
 
 /// Ogg Vorbis (quality 0–10, like most encoders).
 pub fn export_ogg(path: &Path, channels: &[Vec<f32>], rate: u32, quality: u8) -> Result<()> {
+    write_ogg(path, channels, rate, quality, &[])
+}
+
+fn write_ogg(
+    path: &Path,
+    channels: &[Vec<f32>],
+    rate: u32,
+    quality: u8,
+    comments: &[(String, String)],
+) -> Result<()> {
     use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
     let file =
         BufWriter::new(File::create(path).with_context(|| format!("creating {}", path.display()))?);
@@ -424,6 +490,11 @@ pub fn export_ogg(path: &Path, channels: &[Vec<f32>], rate: u32, quality: u8) ->
         target_quality: (quality.min(10) as f32 / 10.0).clamp(-0.1, 1.0),
     });
     let _ = builder.comment_tag("ENCODER", "Rust Audacity");
+    for (k, v) in comments {
+        builder
+            .comment_tag(k.as_str(), v.as_str())
+            .map_err(|e| anyhow!("Ogg tag {k}: {e}"))?;
+    }
     let mut enc = builder
         .build()
         .map_err(|e| anyhow!("Ogg Vorbis encoder setup failed: {e}"))?;
@@ -510,6 +581,77 @@ mod tests {
                 assert!((d.channels[0][1234] - l[1234]).abs() < 1e-3);
             }
         }
+        // Tags, cover art and chapters in every format, and the files still import.
+        let meta = crate::metadata::Metadata {
+            title: "Episode 7".into(),
+            artist: "Ready Rock".into(),
+            album: "The Show".into(),
+            year: "2026".into(),
+            track: "7/20".into(),
+            cover: Some(crate::metadata::Cover {
+                mime: "image/png".into(),
+                data: crate::metadata::tests_png(),
+            }),
+            ..Default::default()
+        };
+        let chapters = [
+            crate::metadata::Chapter {
+                start_ms: 0,
+                end_ms: 400,
+                title: "Intro".into(),
+            },
+            crate::metadata::Chapter {
+                start_ms: 400,
+                end_ms: 1000,
+                title: "Main".into(),
+            },
+        ];
+        for fmt in [
+            ExportFormat::Wav(WavFormat::Pcm16),
+            ExportFormat::Flac { bits: 16 },
+            ExportFormat::Mp3 { kbps: 128 },
+            ExportFormat::Ogg { quality: 4 },
+        ] {
+            let path = dir.join(format!("tagged.{}", fmt.extension()));
+            export_tagged(
+                &path,
+                &[l.clone(), r.clone()],
+                rate,
+                fmt,
+                Some(&meta),
+                &chapters,
+            )
+            .unwrap();
+            let d = import(&path).unwrap_or_else(|e| panic!("{fmt:?} with tags: {e:#}"));
+            assert!(
+                (d.channels[0].len() as i64 - n as i64).abs() < 3000,
+                "{fmt:?}"
+            );
+            let bytes = std::fs::read(&path).unwrap();
+            let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+            assert!(has(b"Episode 7"), "{fmt:?} title");
+            match fmt {
+                ExportFormat::Mp3 { .. } => {
+                    let t = id3::Tag::read_from_path(&path).unwrap();
+                    use id3::TagLike;
+                    assert_eq!(t.title(), Some("Episode 7"));
+                    assert_eq!(t.track(), Some(7));
+                    assert_eq!(t.pictures().count(), 1);
+                    assert_eq!(t.chapters().count(), 2);
+                }
+                ExportFormat::Flac { .. } => {
+                    let t = metaflac::Tag::read_from_path(&path).unwrap();
+                    assert_eq!(t.get_vorbis("TITLE").unwrap().next(), Some("Episode 7"));
+                    assert_eq!(t.get_vorbis("CHAPTER002NAME").unwrap().next(), Some("Main"));
+                    assert_eq!(t.pictures().count(), 1);
+                }
+                ExportFormat::Ogg { .. } => {
+                    assert!(has(b"CHAPTER002NAME=Main") && has(b"METADATA_BLOCK_PICTURE="));
+                }
+                ExportFormat::Wav(_) => assert!(has(b"LIST") && has(b"INAM")),
+            }
+        }
+
         // MP3 at an unsupported rate is resampled.
         let path = dir.join("rt96.mp3");
         export(

@@ -46,6 +46,32 @@ pub fn learn_profile(channels: &[&[f32]], rate: u32) -> Option<NoiseProfile> {
     })
 }
 
+/// Learn a profile from the quietest half-second of the audio (for unattended use:
+/// batch processing and AI agents). None if the audio is too short or silent.
+pub fn auto_profile(channels: &[Vec<f32>], rate: u32) -> Option<NoiseProfile> {
+    let win = (rate / 2) as usize;
+    let len = channels.first()?.len();
+    if len < win || win == 0 {
+        return None;
+    }
+    let mut best: Option<(f32, usize)> = None;
+    let mut i = 0;
+    while i + win <= len {
+        let e: f32 = channels
+            .iter()
+            .map(|c| c[i..i + win].iter().map(|x| x * x).sum::<f32>())
+            .sum::<f32>()
+            / (win * channels.len()) as f32;
+        if e > 1e-12 && best.is_none_or(|(be, _)| e < be) {
+            best = Some((e, i));
+        }
+        i += win / 4;
+    }
+    let (_, at) = best?;
+    let refs: Vec<&[f32]> = channels.iter().map(|c| &c[at..at + win]).collect();
+    learn_profile(&refs, rate)
+}
+
 /// Apply noise reduction to one channel.
 /// * `reduction_db` – how far to turn noise down (e.g. 12 dB)
 /// * `sensitivity_db` – how far above the noise floor a bin must be to count as signal (e.g. 6 dB)

@@ -30,6 +30,28 @@ enum Output {
         peak: f32,
         fmt: ExportFormat,
     },
+    ExportMany {
+        dir: PathBuf,
+        results: Vec<(String, Result<(), String>)>,
+    },
+}
+
+/// What goes into exported files besides the audio.
+#[derive(Clone, Copy)]
+pub(super) struct TagOptions {
+    /// Write the project's metadata (title, artist, cover…).
+    pub tags: bool,
+    /// Write labels as chapters.
+    pub chapters: bool,
+}
+
+impl Default for TagOptions {
+    fn default() -> Self {
+        Self {
+            tags: true,
+            chapters: true,
+        }
+    }
 }
 
 pub(super) struct RunningJob {
@@ -110,13 +132,33 @@ impl AudacityApp {
         };
         let mix = self.project.mixdown(s, e, selection_only);
         let rate = self.project.rate;
+        let meta = (self.tag_opts.tags && !self.project.metadata.is_empty())
+            .then(|| self.project.metadata.clone());
+        // Chapters inside the exported range, relative to its start.
+        let off = (s as f64 * 1000.0 / rate as f64) as u32;
+        let end_ms = (e as f64 * 1000.0 / rate as f64) as u32;
+        let chapters: Vec<crate::metadata::Chapter> = if self.tag_opts.chapters {
+            self.project
+                .chapters()
+                .into_iter()
+                .filter(|c| c.start_ms < end_ms && c.end_ms > off)
+                .map(|c| crate::metadata::Chapter {
+                    start_ms: c.start_ms.max(off) - off,
+                    end_ms: c.end_ms.min(end_ms) - off,
+                    title: c.title,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (tx, rx) = channel();
         let p = path.clone();
         std::thread::Builder::new()
             .name("export".into())
             .spawn(move || {
                 let peak = mix.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
-                let result = fileio::export(&p, &mix, rate, fmt).map_err(|e| format!("{e:#}"));
+                let result = fileio::export_tagged(&p, &mix, rate, fmt, meta.as_ref(), &chapters)
+                    .map_err(|e| format!("{e:#}"));
                 let _ = tx.send(Output::Export {
                     path: p,
                     result,
@@ -135,6 +177,91 @@ impl AudacityApp {
             cancellable: false,
         });
         self.status = format!("Exporting {}…", path.display());
+    }
+
+    /// Export every label region as its own file ("Export Multiple").
+    /// Returns the number of files that will be written.
+    pub(super) fn start_export_many(
+        &mut self,
+        dir: PathBuf,
+        fmt: ExportFormat,
+        before_first: bool,
+        numbered: bool,
+    ) -> Result<usize, String> {
+        if self.busy() {
+            return Err("Rust Audacity is busy.".into());
+        }
+        let regions =
+            crate::labels::export_regions(&self.project.labels, self.project.len(), before_first);
+        if regions.is_empty() {
+            return Err("There are no labels to export. Add labels with Ctrl+B first.".into());
+        }
+        // A lightweight copy of the tracks (audio is shared, not copied).
+        let mut snap = crate::project::Project::default();
+        snap.rate = self.project.rate;
+        snap.tracks = self.project.tracks.clone();
+        let base = self.project.metadata.clone();
+        let tags = self.tag_opts.tags;
+        let n = regions.len();
+        let progress = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let (p2, c2, d2) = (progress.clone(), cancel.clone(), dir.clone());
+        std::thread::Builder::new()
+            .name("export-many".into())
+            .spawn(move || {
+                let mut results = Vec::new();
+                for (i, (s, e, name)) in regions.into_iter().enumerate() {
+                    if c2.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let stem = crate::labels::file_name_part(&name);
+                    let stem = if numbered {
+                        format!("{:02} - {stem}", i + 1)
+                    } else {
+                        stem
+                    };
+                    let mut path = d2.join(format!("{stem}.{}", fmt.extension()));
+                    let mut k = 2;
+                    while path.exists() {
+                        path = d2.join(format!("{stem} ({k}).{}", fmt.extension()));
+                        k += 1;
+                    }
+                    let mix = snap.mixdown(s, e, false);
+                    let mut meta = base.clone();
+                    meta.title = name.clone();
+                    meta.track = format!("{}/{n}", i + 1);
+                    let r = fileio::export_tagged(
+                        &path,
+                        &mix,
+                        snap.rate,
+                        fmt,
+                        tags.then_some(&meta),
+                        &[],
+                    )
+                    .map_err(|e| format!("{e:#}"));
+                    results.push((
+                        path.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                        r,
+                    ));
+                    p2.store(((i + 1) as f32 / n as f32 * 1e6) as u32, Ordering::Relaxed);
+                }
+                let _ = tx.send(Output::ExportMany { dir: d2, results });
+            })
+            .map_err(|e| e.to_string())?;
+        self.job = Some(RunningJob {
+            label: format!("Exporting {n} files"),
+            started: Instant::now(),
+            progress,
+            cancel,
+            rx,
+            determinate: true,
+            cancellable: true,
+        });
+        Ok(n)
     }
 
     /// Running job as JSON (for the agent bridge).
@@ -184,6 +311,21 @@ impl AudacityApp {
             Output::Effect(Err(e)) => {
                 self.dialog = Some(Dialog::Message(format!("{}: {e}", job.label)));
                 self.status = format!("{} failed", job.label);
+            }
+            Output::ExportMany { dir, results } => {
+                let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+                let failed: Vec<String> = results
+                    .iter()
+                    .filter_map(|(n, r)| r.as_ref().err().map(|e| format!("{n}: {e}")))
+                    .collect();
+                self.status = format!("Exported {ok} file(s) to {} ({secs:.1} s)", dir.display());
+                if !failed.is_empty() {
+                    self.dialog = Some(Dialog::Message(format!(
+                        "{} file(s) could not be exported:\n{}",
+                        failed.len(),
+                        failed.join("\n")
+                    )));
+                }
             }
             Output::Export {
                 path,

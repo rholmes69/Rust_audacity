@@ -42,12 +42,16 @@ impl View {
 }
 
 mod analyze_ui;
+mod batch_ui;
 mod bridge_ui;
 mod envelope_ui;
 mod file_ui;
 mod fx_ui;
 mod jobs_ui;
+mod labels_ui;
 mod mcp_ui;
+mod meta_ui;
+mod prefs_ui;
 mod stems_ui;
 mod transcript_ui;
 
@@ -207,6 +211,11 @@ pub struct AudacityApp {
     env_drag: Option<envelope_ui::EnvDrag>,
     duck: envelope_ui::DuckState,
     mcp: mcp_ui::McpState,
+    prefs: prefs_ui::PrefsState,
+    labels_ui: labels_ui::LabelsState,
+    meta_open: bool,
+    tag_opts: jobs_ui::TagOptions,
+    batch: batch_ui::BatchState,
 }
 
 impl AudacityApp {
@@ -257,7 +266,13 @@ impl AudacityApp {
             env_drag: None,
             duck: envelope_ui::DuckState::default(),
             mcp: mcp_ui::McpState::load(cc.storage),
+            prefs: prefs_ui::PrefsState::default(),
+            labels_ui: labels_ui::LabelsState::default(),
+            meta_open: false,
+            tag_opts: jobs_ui::TagOptions::default(),
+            batch: batch_ui::BatchState::default(),
         };
+        app.engine.devices = prefs_ui::load_devices(cc.storage);
         for f in files {
             app.import_path(f);
         }
@@ -394,7 +409,7 @@ impl AudacityApp {
             if self.project.tracks.is_empty() {
                 self.project.rate = self.engine.rec_rate;
             }
-            let chans = self.engine.rec_channels.min(2);
+            let chans = self.engine.rec_track_channels();
             let n = self
                 .project
                 .tracks
@@ -626,6 +641,15 @@ impl AudacityApp {
         if sc(cmd, Key::N) {
             self.confirm_then(Pending::New);
         }
+        if sc(cmd, Key::P) {
+            self.open_prefs();
+        }
+        if sc(cmd_shift, Key::B) {
+            self.labels_ui.window_open = true;
+        }
+        if sc(cmd, Key::B) && !self.busy() {
+            self.add_label_at_selection();
+        }
         if sc(cmd_shift, Key::T) {
             self.transcript.show_panel ^= true;
         }
@@ -777,6 +801,14 @@ impl AudacityApp {
                     self.import_dialog();
                 }
                 ui.separator();
+                if item(ui, "Batch Process…", "", true) {
+                    ui.close();
+                    self.batch.open = true;
+                }
+                if item(ui, "Metadata…", "", true) {
+                    ui.close();
+                    self.meta_open = true;
+                }
                 if item(ui, "Export Audio…", "Ctrl+Shift+E", idle && has_audio) {
                     ui.close();
                     self.open_export_dialog(false);
@@ -860,6 +892,29 @@ impl AudacityApp {
                 if ui.button("Select None").clicked() {
                     self.project.selection = Selection::cursor(self.project.selection.start);
                     ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Add Label at Selection").shortcut_text("Ctrl+B"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.add_label_at_selection();
+                }
+                if ui
+                    .add(egui::Button::new("Labels…").shortcut_text("Ctrl+Shift+B"))
+                    .clicked()
+                {
+                    self.labels_ui.window_open = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Preferences…").shortcut_text("Ctrl+P"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.open_prefs();
                 }
             });
 
@@ -1408,10 +1463,14 @@ impl AudacityApp {
         let sb = Rect::from_min_size(pos2(wave_left, full.bottom() - sb_h), vec2(wave_w, sb_h));
         self.hscrollbar(ui, sb);
 
-        let tracks_rect = Rect::from_min_max(
-            pos2(full.left(), ruler.bottom()),
-            pos2(full.right(), sb.top()),
-        );
+        // Label strip under the ruler.
+        let mut top = ruler.bottom();
+        if !self.project.tracks.is_empty() {
+            let strip = Rect::from_min_size(pos2(wave_left, top), vec2(wave_w, labels_ui::LABEL_H));
+            self.label_strip(ui, strip);
+            top = strip.bottom();
+        }
+        let tracks_rect = Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), sb.top()));
         self.last_track_area =
             Rect::from_min_max(pos2(wave_left, tracks_rect.top()), tracks_rect.max);
         if self.fit_pending {
@@ -1477,6 +1536,8 @@ impl AudacityApp {
                     self.project.remove_track(i);
                 }
             });
+
+        self.draw_label_guides(ui, self.last_track_area);
 
         // Playhead + auto-scroll.
         if (self.engine.is_playing() && !self.previewing) || self.recording.is_some() {
@@ -2184,6 +2245,37 @@ impl AudacityApp {
                             ui.label("");
                             ui.checkbox(selection_only, "Selected audio only");
                             ui.end_row();
+                            ui.label("Tags:");
+                            ui.vertical(|ui| {
+                                let m = &self.project.metadata;
+                                let summary = if m.is_empty() {
+                                    "no metadata yet".to_string()
+                                } else {
+                                    [m.title.as_str(), m.artist.as_str()]
+                                        .iter()
+                                        .filter(|s| !s.is_empty())
+                                        .copied()
+                                        .collect::<Vec<_>>()
+                                        .join(" – ")
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut self.tag_opts.tags, "Write metadata");
+                                    ui.label(egui::RichText::new(summary).small().weak());
+                                    if ui.small_button("Edit…").clicked() {
+                                        self.meta_open = true;
+                                    }
+                                });
+                                if !self.project.labels.is_empty() {
+                                    ui.checkbox(
+                                        &mut self.tag_opts.chapters,
+                                        format!(
+                                            "Write {} label(s) as chapters",
+                                            self.project.labels.len()
+                                        ),
+                                    );
+                                }
+                            });
+                            ui.end_row();
                         }
                         Dialog::Shortcuts => {
                             for (k, v) in [
@@ -2210,6 +2302,9 @@ impl AudacityApp {
                                 ("F1 / F2 / F5", "Selection / Envelope / Time Shift tool"),
                                 ("Right-click point", "Delete an envelope point"),
                                 ("Ctrl+Shift+T", "Show / hide the transcript panel"),
+                                ("Ctrl+B", "Add a label at the selection"),
+                                ("Ctrl+Shift+B", "Labels window"),
+                                ("Ctrl+P", "Preferences (audio devices)"),
                                 ("Ctrl+N", "New project"),
                                 ("Ctrl+O", "Open project"),
                                 ("Ctrl+S / Ctrl+Shift+S", "Save project / Save As"),
@@ -2223,7 +2318,7 @@ impl AudacityApp {
                         }
                         Dialog::About => {
                             ui.label(
-                            "Rust Audacity 0.6\nAn Audacity-style audio editor written in Rust.\n\n\
+                            "Rust Audacity 0.7\nAn Audacity-style audio editor written in Rust.\n\n\
                              egui/eframe · cpal · symphonia · hound · realfft · ebur128\n\
                              flacenc · LAME (MP3) · libvorbis/aoTuV (Ogg)\n\
                              AI stem separation via Meta's Demucs (optional, external).",
@@ -2312,6 +2407,7 @@ impl eframe::App for AudacityApp {
         self.poll_stems(&ctx);
         self.poll_job(&ctx);
         self.poll_transcription(&ctx);
+        self.poll_batch(&ctx);
         self.poll_bridge(&ctx);
         self.sync_mcp();
         if ctx.input(|i| i.viewport().close_requested())
@@ -2397,6 +2493,10 @@ impl eframe::App for AudacityApp {
         self.transcribe_windows(&ctx);
         self.duck_window(&ctx);
         self.mcp_window(&ctx);
+        self.prefs_window(&ctx);
+        self.label_windows(&ctx);
+        self.metadata_window(&ctx);
+        self.batch_window(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2406,6 +2506,7 @@ impl eframe::App for AudacityApp {
         self.transcript.save(storage);
         self.bridge.save(storage);
         self.mcp.save(storage);
+        prefs_ui::save_devices(storage, &self.engine.devices);
     }
 
     fn on_exit(&mut self) {
