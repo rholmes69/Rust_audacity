@@ -4,6 +4,7 @@
 pub mod analysis;
 pub mod biquad;
 pub mod denoise;
+pub mod duck;
 pub mod dynamics;
 pub mod restore;
 pub mod separation;

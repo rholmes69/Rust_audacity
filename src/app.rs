@@ -43,9 +43,11 @@ impl View {
 
 mod analyze_ui;
 mod bridge_ui;
+mod envelope_ui;
 mod file_ui;
 mod fx_ui;
 mod jobs_ui;
+mod mcp_ui;
 mod stems_ui;
 mod transcript_ui;
 
@@ -58,6 +60,8 @@ enum Tool {
     Select,
     /// Drag tracks or the selected audio along the timeline.
     TimeShift,
+    /// Draw volume envelopes.
+    Envelope,
 }
 
 /// An in-progress Time Shift drag.
@@ -200,6 +204,9 @@ pub struct AudacityApp {
     fit_pending: bool,
     transcript: transcript_ui::TranscriptState,
     bridge: bridge_ui::BridgeState,
+    env_drag: Option<envelope_ui::EnvDrag>,
+    duck: envelope_ui::DuckState,
+    mcp: mcp_ui::McpState,
 }
 
 impl AudacityApp {
@@ -247,6 +254,9 @@ impl AudacityApp {
             fit_pending: false,
             transcript: transcript_ui::TranscriptState::load(cc.storage),
             bridge: bridge_ui::BridgeState::load(cc.storage),
+            env_drag: None,
+            duck: envelope_ui::DuckState::default(),
+            mcp: mcp_ui::McpState::load(cc.storage),
         };
         for f in files {
             app.import_path(f);
@@ -625,6 +635,9 @@ impl AudacityApp {
         if sc(Modifiers::NONE, Key::F5) {
             self.tool = Tool::TimeShift;
         }
+        if sc(Modifiers::NONE, Key::F2) {
+            self.tool = Tool::Envelope;
+        }
         if sc(cmd, Key::X) {
             self.do_edit(Project::cut, "Cut");
         }
@@ -944,6 +957,29 @@ impl AudacityApp {
                     self.remove_selected_tracks();
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new("Auto Duck…"))
+                    .on_hover_text("Lower music automatically while someone speaks")
+                    .clicked()
+                {
+                    ui.close();
+                    self.open_duck_dialog();
+                }
+                if ui.button("Envelope Tool").on_hover_text("F2").clicked() {
+                    self.tool = Tool::Envelope;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !self.busy(),
+                        egui::Button::new("Clear Envelope (selected tracks)"),
+                    )
+                    .clicked()
+                {
+                    ui.close();
+                    self.clear_envelopes();
+                }
             });
 
             ui.menu_button("Generate", |ui| {
@@ -1049,6 +1085,22 @@ impl AudacityApp {
                 );
                 if let Some(e) = &self.bridge.error {
                     ui.colored_label(Color32::from_rgb(230, 120, 90), e);
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.mcp.enabled, "Built-in MCP server (HTTP)")
+                    .changed()
+                {
+                    self.mcp.error = None;
+                }
+                if let Some(e) = &self.mcp.error {
+                    ui.colored_label(Color32::from_rgb(230, 120, 90), e);
+                } else if self.mcp.running() {
+                    ui.label(egui::RichText::new(self.mcp.url()).small().monospace());
+                }
+                if ui.button("MCP Server Settings & Setup…").clicked() {
+                    self.mcp.window_open = true;
+                    ui.close();
                 }
                 if let Some(t) = self.bridge.last_request {
                     ui.label(
@@ -1163,6 +1215,16 @@ impl AudacityApp {
                 .clicked()
             {
                 self.tool = Tool::TimeShift;
+            }
+            if ui
+                .add(egui::Button::new(big("⌇")).selected(self.tool == Tool::Envelope))
+                .on_hover_text(
+                    "Envelope tool (F2): click a track to add volume points, drag them,\n\
+                     right-click a point to delete it",
+                )
+                .clicked()
+            {
+                self.tool = Tool::Envelope;
             }
             ui.separator();
             let pos = if playing || recording {
@@ -1280,6 +1342,27 @@ impl AudacityApp {
             ui.separator();
             if self.importing > 0 {
                 ui.spinner();
+            }
+            if let Some((text, recent)) = self.mcp.status_text() {
+                let col = if recent {
+                    Color32::from_rgb(140, 200, 255)
+                } else {
+                    Color32::from_rgb(110, 170, 120)
+                };
+                if ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(text).small().color(col))
+                            .sense(Sense::click()),
+                    )
+                    .on_hover_text(format!(
+                        "Built-in MCP server at {} — click for settings",
+                        self.mcp.url()
+                    ))
+                    .clicked()
+                {
+                    self.mcp.window_open = true;
+                }
+                ui.separator();
             }
             if self.bridge.active_recently() {
                 ui.label(
@@ -1743,6 +1826,7 @@ impl AudacityApp {
         }
 
         self.draw_word_labels(&painter, i, rect, draw_left);
+        self.draw_envelope(&painter, i, rect, draw_left);
 
         // Selection highlight.
         if selected && !sel.is_empty() {
@@ -1815,6 +1899,10 @@ impl AudacityApp {
         }
         if self.tool == Tool::TimeShift {
             self.time_shift_interaction(ui, i, rect, &resp);
+            return;
+        }
+        if self.tool == Tool::Envelope {
+            self.envelope_interaction(ui, i, rect, &resp);
             return;
         }
         let ptr = ui
@@ -2119,7 +2207,8 @@ impl AudacityApp {
                                 ("Ctrl+E / Ctrl+F", "Zoom to selection / fit"),
                                 ("Ctrl+wheel", "Zoom at pointer"),
                                 ("Shift+wheel", "Scroll horizontally"),
-                                ("F1 / F5", "Selection tool / Time Shift tool"),
+                                ("F1 / F2 / F5", "Selection / Envelope / Time Shift tool"),
+                                ("Right-click point", "Delete an envelope point"),
                                 ("Ctrl+Shift+T", "Show / hide the transcript panel"),
                                 ("Ctrl+N", "New project"),
                                 ("Ctrl+O", "Open project"),
@@ -2134,7 +2223,7 @@ impl AudacityApp {
                         }
                         Dialog::About => {
                             ui.label(
-                            "Rust Audacity 0.4\nAn Audacity-style audio editor written in Rust.\n\n\
+                            "Rust Audacity 0.6\nAn Audacity-style audio editor written in Rust.\n\n\
                              egui/eframe · cpal · symphonia · hound · realfft · ebur128\n\
                              flacenc · LAME (MP3) · libvorbis/aoTuV (Ogg)\n\
                              AI stem separation via Meta's Demucs (optional, external).",
@@ -2224,6 +2313,7 @@ impl eframe::App for AudacityApp {
         self.poll_job(&ctx);
         self.poll_transcription(&ctx);
         self.poll_bridge(&ctx);
+        self.sync_mcp();
         if ctx.input(|i| i.viewport().close_requested())
             && !self.close_confirmed
             && self.has_unsaved_changes()
@@ -2305,6 +2395,8 @@ impl eframe::App for AudacityApp {
         self.stems_windows(&ctx);
         self.job_window(&ctx);
         self.transcribe_windows(&ctx);
+        self.duck_window(&ctx);
+        self.mcp_window(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -2313,9 +2405,11 @@ impl eframe::App for AudacityApp {
         self.save_export_format(storage);
         self.transcript.save(storage);
         self.bridge.save(storage);
+        self.mcp.save(storage);
     }
 
     fn on_exit(&mut self) {
+        self.mcp.shutdown();
         self.bridge.shutdown();
         self.engine.stop_recording();
         self.engine.stop_playback();

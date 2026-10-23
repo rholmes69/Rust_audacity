@@ -198,15 +198,20 @@ impl Client {
              (and keep Agents ▸ Allow AI agents to control this window turned on).";
         let text = std::fs::read_to_string(info_path()).map_err(|_| NOT_RUNNING.to_string())?;
         let info: BridgeInfo = serde_json::from_str(&text).map_err(|_| NOT_RUNNING.to_string())?;
+        Self::connect_to(&info).map_err(|_| NOT_RUNNING.to_string())
+    }
+
+    /// Connect to a known bridge (used by the app's built-in MCP server).
+    pub fn connect_to(info: &BridgeInfo) -> Result<Client, String> {
         let stream =
             TcpStream::connect_timeout(&([127, 0, 0, 1], info.port).into(), Duration::from_secs(2))
-                .map_err(|_| NOT_RUNNING.to_string())?;
+                .map_err(|e| format!("cannot reach the Rust Audacity window: {e}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(75)))
             .map_err(|e| e.to_string())?;
         Ok(Client {
             stream: BufReader::new(stream),
-            token: info.token,
+            token: info.token.clone(),
         })
     }
 

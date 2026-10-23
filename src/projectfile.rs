@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    envelope::{EnvPoint, Envelope},
     project::{Project, Selection},
     track::{Track, TrackView},
     transcript::{Transcript, Word},
@@ -64,6 +65,9 @@ struct TrackHeader {
     selected: bool,
     height: f32,
     spectrogram: bool,
+    /// Volume envelope points as (sample, dB).
+    #[serde(default)]
+    envelope: Vec<(usize, f32)>,
 }
 
 /// Horizontal view saved with a project.
@@ -93,6 +97,7 @@ pub fn save(path: &Path, project: &Project, view: Option<ViewState>) -> Result<(
                 selected: t.selected,
                 height: t.height,
                 spectrogram: t.view == TrackView::Spectrogram,
+                envelope: t.envelope.points.iter().map(|p| (p.pos, p.db)).collect(),
             })
             .collect(),
         view,
@@ -212,6 +217,12 @@ pub fn load(path: &Path) -> Result<Loaded> {
         t.solo = th.solo;
         t.selected = th.selected;
         t.height = th.height.clamp(60.0, 600.0);
+        t.envelope = Envelope::from_points(
+            th.envelope
+                .iter()
+                .map(|&(pos, db)| EnvPoint { pos, db })
+                .collect(),
+        );
         t.view = if th.spectrogram {
             TrackView::Spectrogram
         } else {
@@ -266,6 +277,7 @@ mod tests {
         p.tracks[1].solo = true;
         p.tracks[1].selected = false;
         p.tracks[1].view = TrackView::Spectrogram;
+        p.tracks[0].envelope = Envelope::from_points(vec![EnvPoint { pos: 7, db: -6.5 }]);
         p.selection = Selection::new(100, 900);
         let view = ViewState {
             left: 12.5,
@@ -295,6 +307,7 @@ mod tests {
         assert_eq!(*q.tracks[0].channels[0], l, "audio must be bit-exact");
         assert_eq!(*q.tracks[0].channels[1], r);
         assert_eq!((q.tracks[0].gain, q.tracks[0].pan), (0.5, -0.3));
+        assert_eq!(q.tracks[0].envelope, p.tracks[0].envelope);
         assert_eq!(q.tracks[1].name, "Bass ✓");
         assert!(q.tracks[1].mute && q.tracks[1].solo && !q.tracks[1].selected);
         assert_eq!(q.tracks[1].view, TrackView::Spectrogram);

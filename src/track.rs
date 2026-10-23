@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use crate::envelope::Envelope;
+
 pub type Channel = Arc<Vec<f32>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -34,6 +36,8 @@ pub struct Track {
     pub height: f32,
     /// Waveform or spectrogram display.
     pub view: TrackView,
+    /// Volume automation (empty = flat 0 dB). Applied on playback and mixdown.
+    pub envelope: Envelope,
 }
 
 impl Track {
@@ -58,6 +62,7 @@ impl Track {
             selected: true,
             height: 150.0,
             view: TrackView::Waveform,
+            envelope: Envelope::default(),
         }
     }
 
@@ -87,26 +92,41 @@ impl Track {
 
     /// Remove a range of samples from every channel (later audio shifts left).
     pub fn remove(&mut self, start: usize, end: usize) {
+        if let Some((s, e)) = self.raw_remove(start, end) {
+            self.envelope.retime(s, e, s);
+        }
+    }
+
+    fn raw_remove(&mut self, start: usize, end: usize) -> Option<(usize, usize)> {
         let len = self.len();
         let (s, e) = (start.min(len), end.min(len));
         if s >= e {
-            return;
+            return None;
         }
         for c in &mut self.channels {
             Arc::make_mut(c).drain(s..e);
         }
+        Some((s, e))
     }
 
     /// Insert audio at `pos` (later audio shifts right). Pads with silence if
     /// `pos` is past the end. Channel counts are adapted (mono<->stereo).
     pub fn insert(&mut self, pos: usize, data: &[Vec<f32>]) {
+        let len = self.len();
+        let n = self.raw_insert(pos, data);
+        if n > 0 && pos < len {
+            self.envelope.retime(pos, pos, pos + n);
+        }
+    }
+
+    fn raw_insert(&mut self, pos: usize, data: &[Vec<f32>]) -> usize {
         if data.is_empty() {
-            return;
+            return 0;
         }
         let data = adapt_channels(data, self.num_channels());
         let ins_len = data[0].len();
         if ins_len == 0 {
-            return;
+            return 0;
         }
         let len = self.len();
         for (c, d) in self.channels.iter_mut().zip(data.iter()) {
@@ -117,6 +137,7 @@ impl Track {
             let p = pos.min(v.len());
             v.splice(p..p, d.iter().copied());
         }
+        ins_len
     }
 
     /// Overwrite samples in a range with silence.
@@ -136,10 +157,16 @@ impl Track {
         }
     }
 
-    /// Replace a range with new (possibly different length) audio.
+    /// Replace a range with new (possibly different length) audio. Envelope points inside
+    /// the range are kept (scaled if the length changes).
     pub fn replace(&mut self, start: usize, end: usize, data: &[Vec<f32>]) {
-        self.remove(start, end);
-        self.insert(start, data);
+        let len = self.len();
+        let (s, e) = (start.min(len), end.min(len));
+        self.raw_remove(s, e);
+        let n = self.raw_insert(start, data);
+        if start <= len {
+            self.envelope.retime(s, e, s + n);
+        }
     }
 
     /// Ensure all channels are at least `len` samples long.
@@ -253,6 +280,24 @@ mod tests {
         t.silence(0, 2);
         assert_eq!(*snapshot.channels[0], vec![1.0, 2.0]);
         assert_eq!(*t.channels[0], vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn envelope_follows_edits() {
+        use crate::envelope::EnvPoint;
+        let mut t = Track::new(1, "t", vec![vec![0.0; 100]]);
+        t.envelope = Envelope::from_points(vec![
+            EnvPoint { pos: 10, db: 0.0 },
+            EnvPoint { pos: 50, db: -12.0 },
+        ]);
+        t.insert(0, &[vec![0.0; 5]]);
+        assert_eq!(t.envelope.points[1].pos, 55);
+        // Same-length replace (an effect) keeps the points.
+        t.replace(0, 100, &[vec![1.0; 100]]);
+        assert_eq!(t.envelope.points[1].pos, 55);
+        // Half-length replace (tempo change) scales them.
+        t.replace(0, 105, &[vec![1.0; 50]]);
+        assert_eq!(t.envelope.points[1].pos, 26);
     }
 
     #[test]

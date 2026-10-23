@@ -4,7 +4,9 @@
 pub mod bridge;
 pub mod dsp;
 pub mod effects;
+pub mod envelope;
 pub mod fileio;
+pub mod mcp;
 pub mod project;
 pub mod projectfile;
 pub mod track;

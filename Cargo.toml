@@ -2,7 +2,7 @@
 name = "rust_audacity"
 description = "A small Audacity-style audio editor written in Rust"
 license = "MIT"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2024"
 default-run = "rust_audacity"
 

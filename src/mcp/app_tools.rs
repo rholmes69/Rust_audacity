@@ -4,18 +4,19 @@
 
 use std::time::{Duration, Instant};
 
-use rust_audacity::{
+use crate::{
     bridge::Client,
     effects::{Effect, builtin_chains},
 };
 use serde_json::{Value, json};
 
-use crate::{
+use super::{
     Config, Progress,
     tools::{Output, R, b, f, input_path, norm, output_path, parse_effect, req_str, s},
 };
 
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 11] = [
+    "app_auto_duck",
     "app_status",
     "app_open",
     "app_select",
@@ -112,7 +113,8 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "app_track",
             "Rust Audacity window: track settings",
-            "Change a track's name, gain (dB), pan (-1 left … 1 right), mute, solo or selected state.",
+            "Change a track's name, gain (dB), pan (-1 left … 1 right), mute, solo or selected state, or set its volume \
+             envelope: `envelope` = [[seconds, dB], …] points joined by straight lines (0 dB = unchanged, -60 = silent); [] clears it.",
             json!({
                 "index": { "type": "integer" },
                 "name": { "type": "string" },
@@ -121,8 +123,28 @@ pub fn definitions() -> Vec<Value> {
                 "mute": { "type": "boolean" },
                 "solo": { "type": "boolean" },
                 "selected": { "type": "boolean" },
+                "envelope": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "Volume envelope points [[seconds, dB], …]; [] removes the envelope." },
             }),
             &["index"],
+            false,
+        ),
+        tool(
+            "app_auto_duck",
+            "Rust Audacity window: auto duck",
+            "Lower music (or any tracks) automatically while someone speaks on the voice track, by writing volume-envelope \
+             points the user can see and adjust (Envelope tool, F2). Uses the transcript's word timings when the voice track \
+             has been transcribed, otherwise the voice level. Replaces existing envelopes on the ducked tracks; one undo step.",
+            json!({
+                "voice_track": { "type": "integer", "description": "Index of the speech track (default: the transcribed track)." },
+                "duck_tracks": { "type": "array", "items": { "type": "integer" }, "description": "Tracks to lower (default: all others)." },
+                "amount_db": secs("How much to lower, in dB (default 12)."),
+                "threshold_db": secs("Voice level counted as speech, dBFS (default -35; lower = more sensitive)."),
+                "fade_down_ms": secs("Fade-down time (default 300)."),
+                "fade_up_ms": secs("Fade-up time (default 700)."),
+                "hold_ms": secs("Stay down through pauses shorter than this (default 800)."),
+                "use_transcript": { "type": "boolean", "description": "Use transcript words if available (default true)." },
+            }),
+            &[],
             false,
         ),
         tool(
@@ -295,7 +317,10 @@ fn out(text: String, data: Value) -> R<Output> {
 }
 
 pub fn call(name: &str, args: &Value, cfg: &Config, progress: &Progress) -> R<Output> {
-    let mut c = Client::connect()?;
+    let mut c = match &cfg.bridge {
+        Some(info) => Client::connect_to(info)?,
+        None => Client::connect()?,
+    };
     match name {
         "app_status" => {
             let st = c.call("status", json!({ "measure": b(args, "measure") }))?;
@@ -381,8 +406,29 @@ pub fn call(name: &str, args: &Value, cfg: &Config, progress: &Progress) -> R<Ou
             out(text, json!({ "result": r, "status": st }))
         }
         "app_track" => {
-            let r = c.call("track", args.clone())?;
+            let mut a = args.clone();
+            let env = a.as_object_mut().and_then(|o| o.remove("envelope"));
+            if let Some(points) = env {
+                c.call(
+                    "envelope",
+                    json!({ "index": args["index"], "points": points }),
+                )?;
+            }
+            let r = c.call("track", a)?;
             out(format!("Track updated: {r}"), r)
+        }
+        "app_auto_duck" => {
+            let r = c.call("auto_duck", args.clone())?;
+            out(
+                format!(
+                    "Ducked track(s) {} by {} dB during {} stretch(es) of speech on track {}. The envelope is visible in the app (Envelope tool, F2) and undoable.",
+                    r["ducked_tracks"],
+                    -r["amount_db"].as_f64().unwrap_or(12.0),
+                    r["speech_regions"],
+                    r["voice_track"]
+                ),
+                r,
+            )
         }
         "app_playback" => {
             let action = req_str(args, "action")?;

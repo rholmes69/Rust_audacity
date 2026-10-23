@@ -16,7 +16,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
-use crate::{project::Project, track::Channel};
+use crate::{envelope::Envelope, project::Project, track::Channel};
 
 /// State shared between the UI thread and the audio callbacks.
 pub struct Shared {
@@ -68,6 +68,8 @@ fn bump_peak(meter: &AtomicU32, v: f32) {
 /// Immutable snapshot of the audio the callback plays.
 struct Source {
     tracks: Vec<Vec<Channel>>,
+    /// Volume envelope per track (None = flat).
+    envelopes: Vec<Option<Envelope>>,
     start: usize,
     end: usize,
     /// project samples advanced per device frame
@@ -162,6 +164,11 @@ impl Engine {
 
         let source = Arc::new(Source {
             tracks: p.tracks.iter().map(|t| t.channels.clone()).collect(),
+            envelopes: p
+                .tracks
+                .iter()
+                .map(|t| (!t.envelope.is_empty()).then(|| t.envelope.clone()))
+                .collect(),
             start,
             end,
             step: p.rate as f64 / config.sample_rate as f64,
@@ -269,7 +276,16 @@ where
             let looping = shared.looping.load(Ordering::Relaxed);
             let mut pos = shared.pos();
             let (mut pk_l, mut pk_r) = (0f32, 0f32);
-            for frame in data.chunks_mut(out_ch) {
+            // Envelope gains are evaluated at the block's start and end and interpolated.
+            let frames = data.len() / out_ch;
+            let block_end = pos + frames as f64 * src.step;
+            let env: Vec<Option<(f32, f32)>> = src
+                .envelopes
+                .iter()
+                .map(|e| e.as_ref().map(|e| (e.gain_at(pos), e.gain_at(block_end))))
+                .collect();
+            for (frame_i, frame) in data.chunks_mut(out_ch).enumerate() {
+                let t = frame_i as f32 / frames.max(1) as f32;
                 let (mut l, mut r) = (0f32, 0f32);
                 if !paused && !shared.finished.load(Ordering::Relaxed) {
                     if pos >= src.end as f64 {
@@ -283,9 +299,14 @@ where
                         let i0 = pos as usize;
                         let fr = (pos - i0 as f64) as f32;
                         for (ti, chans) in src.tracks.iter().enumerate() {
-                            let (gl, gr) = gains.get(ti).copied().unwrap_or((0.0, 0.0));
+                            let (mut gl, mut gr) = gains.get(ti).copied().unwrap_or((0.0, 0.0));
                             if gl == 0.0 && gr == 0.0 {
                                 continue;
+                            }
+                            if let Some(Some((g0, g1))) = env.get(ti) {
+                                let g = g0 + (g1 - g0) * t;
+                                gl *= g;
+                                gr *= g;
                             }
                             let sample = |c: &Channel| -> f32 {
                                 if i0 >= c.len() {

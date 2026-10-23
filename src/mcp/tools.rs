@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rust_audacity::{
+use crate::{
     dsp::{
         analysis::{self, Stats},
         denoise,
@@ -16,7 +16,7 @@ use rust_audacity::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::{Config, Progress};
+use super::{Config, Progress};
 
 pub(crate) type R<T> = Result<T, String>;
 
@@ -42,7 +42,7 @@ const TOOL_NAMES: [&str; 11] = [
 ];
 
 pub fn exists(name: &str) -> bool {
-    TOOL_NAMES.contains(&name) || crate::app_tools::exists(name)
+    TOOL_NAMES.contains(&name) || super::app_tools::exists(name)
 }
 
 // ---------------------------------------------------------------- definitions
@@ -202,12 +202,13 @@ pub fn definitions() -> Vec<Value> {
         tool(
             "mix_audio",
             "Mix audio files",
-            "Mix several audio files into one stereo WAV (e.g. recombine stems at new levels, or lay music under a voice-over). Each input can have a gain, pan and start offset.",
+            "Mix several audio files into one stereo file (e.g. recombine stems at new levels, or lay music under a voice-over). Each input can have a gain, pan and start offset; give the music `duck_db` to lower it automatically while the voice is speaking.",
             json!({
                 "inputs": { "type": "array", "items": { "type": "object", "properties": {
                     "path": p_path("Audio file."), "gain_db": p_num("Level change in dB (default 0)."),
                     "pan": p_num("-1 left … 0 centre … 1 right (default 0)."), "offset": p_num("Start time in the mix, seconds (default 0)."),
-                    "mute": { "type": "boolean" }
+                    "mute": { "type": "boolean" },
+                    "duck_db": p_num("Auto-duck this input (e.g. music) by this many dB, e.g. -12, whenever the other inputs (the voice) are sounding.")
                   }, "required": ["path"] } },
                 "output": p_path("Output path: .wav, .flac, .mp3 or .ogg."),
                 "normalize_peak_db": p_num("If set, scale the mix so its peak is this many dBFS (e.g. -1)."),
@@ -298,7 +299,7 @@ pub fn definitions() -> Vec<Value> {
         ),
     ]
     .into_iter()
-    .chain(crate::app_tools::definitions())
+    .chain(super::app_tools::definitions())
     .collect()
 }
 
@@ -324,8 +325,8 @@ pub fn call(
     progress: &Progress,
     cancel: &CancelHandle,
 ) -> R<Output> {
-    if crate::app_tools::exists(name) {
-        return crate::app_tools::call(name, args, cfg, progress);
+    if super::app_tools::exists(name) {
+        return super::app_tools::call(name, args, cfg, progress);
     }
     match name {
         "transcribe_audio" => transcribe_audio(args, cfg, progress, cancel),
@@ -552,7 +553,7 @@ fn transcribe_audio(
     progress: &Progress,
     cancel: &CancelHandle,
 ) -> R<Output> {
-    use rust_audacity::whisper::{self, WhisperEvent, WhisperModel, WhisperOptions};
+    use crate::whisper::{self, WhisperEvent, WhisperModel, WhisperOptions};
     let input = input_path(cfg, req_str(args, "input")?)?;
     let model = match s(args, "model") {
         Some(m) => WhisperModel::from_id(m).ok_or_else(|| format!("unknown model {m}"))?,
@@ -1503,6 +1504,41 @@ fn mix_audio(args: &Value, cfg: &Config) -> R<Output> {
         t.mute = b(inp, "mute");
         used.push(path.display().to_string());
     }
+    // Auto-ducking: inputs with `duck_db` dip whenever the other inputs are active.
+    let ducked: Vec<(usize, f32)> = inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, inp)| f(inp, "duck_db").map(|d| (i, d as f32)))
+        .collect();
+    let mut duck_note = String::new();
+    if !ducked.is_empty() {
+        let len = p.len();
+        let mut control = vec![0f32; len];
+        for (i, t) in p.tracks.iter().enumerate() {
+            if t.mute || ducked.iter().any(|(d, _)| *d == i) {
+                continue;
+            }
+            for (c, x) in control.iter_mut().zip(t.channels[0].iter()) {
+                *c += x * t.gain;
+            }
+        }
+        let base = crate::dsp::duck::DuckParams::default();
+        let regions =
+            crate::dsp::duck::detect_speech(&control, p.rate, base.threshold_db, base.hold_ms);
+        for &(i, db) in &ducked {
+            let params = crate::dsp::duck::DuckParams {
+                amount_db: -db.abs(),
+                ..base
+            };
+            let tl = p.tracks[i].len();
+            p.tracks[i].envelope = crate::dsp::duck::duck_envelope(&regions, tl, p.rate, &params);
+        }
+        duck_note = format!(
+            "\nDucked {} input(s) during {} stretch(es) of speech.",
+            ducked.len(),
+            regions.len()
+        );
+    }
     let mut mix = p.mixdown(0, p.len(), false);
     if mix.len() == 1 {
         mix = adapt_channels(&mix, 2);
@@ -1529,7 +1565,11 @@ fn mix_audio(args: &Value, cfg: &Config) -> R<Output> {
     }
     let data = json!({ "output": out.display().to_string(), "inputs": used, "sample_rate": p.rate, "levels": stats_json(&st) });
     Ok(Output {
-        text: format!("Wrote {}\n{}{warn}", out.display(), summary_line(&st)),
+        text: format!(
+            "Wrote {}\n{}{warn}{duck_note}",
+            out.display(),
+            summary_line(&st)
+        ),
         data,
         png: None,
     })

@@ -66,6 +66,11 @@ impl BridgeState {
         self.server = None;
     }
 
+    /// Port and token of the running bridge (for the built-in MCP server).
+    pub fn info(&self) -> Option<crate::bridge::BridgeInfo> {
+        self.server.as_ref().map(|s| s.info.clone())
+    }
+
     pub fn active_recently(&self) -> bool {
         self.last_request
             .is_some_and(|t| t.elapsed().as_secs_f32() < 4.0)
@@ -167,6 +172,7 @@ impl AudacityApp {
                     "mute": t.mute,
                     "solo": t.solo,
                     "selected": t.selected,
+                    "envelope": t.envelope.points.iter().map(|p| json!([secs(r, p.pos), (p.db * 10.0).round() / 10.0])).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -605,6 +611,81 @@ impl AudacityApp {
                 }
                 let n = self.remove_fillers();
                 Ok(json!({ "removed": n, "duration": secs(r, self.project.len()) }))
+            }
+            "auto_duck" => {
+                self.require_idle()?;
+                let n = self.project.tracks.len();
+                let voice = match a.get("voice_track").and_then(Value::as_u64) {
+                    Some(v) => v as usize,
+                    None => self
+                        .project
+                        .transcript_track()
+                        .ok_or("pass `voice_track` (index of the speech track)")?,
+                };
+                if voice >= n {
+                    return Err("voice_track out of range".into());
+                }
+                let targets: Vec<usize> = match a.get("duck_tracks").and_then(Value::as_array) {
+                    Some(list) => list
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .map(|x| x as usize)
+                        .collect(),
+                    None => (0..n).filter(|&i| i != voice).collect(),
+                };
+                let mut params = crate::dsp::duck::DuckParams::default();
+                if let Some(v) = f(a, "amount_db") {
+                    params.amount_db = -(v.abs() as f32);
+                }
+                if let Some(v) = f(a, "threshold_db") {
+                    params.threshold_db = v as f32;
+                }
+                if let Some(v) = f(a, "fade_down_ms") {
+                    params.fade_down_ms = v as f32;
+                }
+                if let Some(v) = f(a, "fade_up_ms") {
+                    params.fade_up_ms = v as f32;
+                }
+                if let Some(v) = f(a, "hold_ms") {
+                    params.hold_ms = v as f32;
+                }
+                let use_words = a
+                    .get("use_transcript")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let regions = self.run_auto_duck(voice, &targets, &params, use_words)?;
+                Ok(
+                    json!({ "voice_track": voice, "ducked_tracks": targets, "speech_regions": regions, "amount_db": params.amount_db }),
+                )
+            }
+            "envelope" => {
+                let i = a
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or("missing `index`")? as usize;
+                if i >= self.project.tracks.len() {
+                    return Err("track index out of range".into());
+                }
+                let pts = a
+                    .get("points")
+                    .and_then(Value::as_array)
+                    .ok_or("pass `points`: [[seconds, dB], …] (empty to clear)")?;
+                let mut points = Vec::new();
+                for pt in pts {
+                    let (Some(t), Some(db)) = (
+                        pt.get(0).and_then(Value::as_f64),
+                        pt.get(1).and_then(Value::as_f64),
+                    ) else {
+                        return Err("each point must be [seconds, dB]".into());
+                    };
+                    points.push(crate::envelope::EnvPoint {
+                        pos: (t.max(0.0) * r as f64).round() as usize,
+                        db: db as f32,
+                    });
+                }
+                self.project.push_undo("Envelope");
+                self.project.tracks[i].envelope = crate::envelope::Envelope::from_points(points);
+                Ok(json!({ "index": i, "points": self.project.tracks[i].envelope.points.len() }))
             }
             "dismiss_dialog" => {
                 let had = self.dialog.take().is_some();

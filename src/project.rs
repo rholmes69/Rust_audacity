@@ -237,6 +237,59 @@ impl Project {
         true
     }
 
+    // ----- auto-ducking -------------------------------------------------------
+
+    /// Lower `targets` wherever `voice` is speaking by writing their volume envelopes
+    /// (replacing any existing envelope). Uses the transcript's words when it belongs to
+    /// the voice track and `use_words` is set, otherwise the voice level.
+    /// Returns the number of speech regions found.
+    pub fn auto_duck(
+        &mut self,
+        voice: usize,
+        targets: &[usize],
+        params: &crate::dsp::duck::DuckParams,
+        use_words: bool,
+    ) -> Result<usize, String> {
+        use crate::dsp::duck;
+        let v = self.tracks.get(voice).ok_or("no such voice track")?;
+        let targets: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|&t| t != voice && t < self.tracks.len())
+            .collect();
+        if targets.is_empty() {
+            return Err("Choose at least one track to duck (other than the voice).".into());
+        }
+        let regions = match (&self.transcript, use_words) {
+            (Some(tr), true) if tr.track_id == v.id => {
+                let words: Vec<(usize, usize)> =
+                    tr.words.iter().map(|w| (w.start, w.end)).collect();
+                duck::regions_from_words(&words, self.rate, params.hold_ms)
+            }
+            _ => {
+                let data: Vec<Vec<f32>> = v.channels.iter().map(|c| c.to_vec()).collect();
+                let mono = crate::track::adapt_channels(&data, 1)
+                    .pop()
+                    .unwrap_or_default();
+                // Track gain counts: a quiet voice track at +6 dB is louder than it looks.
+                let mono: Vec<f32> = mono.iter().map(|x| x * v.gain).collect();
+                duck::detect_speech(&mono, self.rate, params.threshold_db, params.hold_ms)
+            }
+        };
+        if regions.is_empty() {
+            return Err(
+                "No speech was found on the voice track. Try a lower threshold (e.g. −45 dB)."
+                    .into(),
+            );
+        }
+        self.push_undo("Auto Duck");
+        for t in targets {
+            let len = self.tracks[t].len();
+            self.tracks[t].envelope = duck::duck_envelope(&regions, len, self.rate, params);
+        }
+        Ok(regions.len())
+    }
+
     // ----- tracks ------------------------------------------------------------
 
     pub fn add_track(&mut self, name: impl Into<String>, channels: Vec<Vec<f32>>) -> usize {
@@ -608,13 +661,15 @@ impl Project {
         for t in audible {
             let (gl, gr) = t.lr_gains();
             let tl = t.len();
+            let env = t.envelope.gains(start, len.min(tl.saturating_sub(start)));
             for i in 0..len {
                 let idx = start + i;
                 if idx >= tl {
                     break;
                 }
-                let l = t.channels[0][idx];
-                let r = t.channels.get(1).map_or(l, |c| c[idx]);
+                let g = env.as_ref().map_or(1.0, |e| e[i]);
+                let l = t.channels[0][idx] * g;
+                let r = t.channels.get(1).map_or(l, |c| c[idx] * g);
                 if stereo {
                     out[0][i] += l * gl;
                     out[1][i] += r * gr;
@@ -763,6 +818,35 @@ mod tests {
         // Removing the track drops the transcript.
         p.remove_track(0);
         assert!(p.transcript.is_none());
+    }
+
+    #[test]
+    fn auto_duck_writes_envelopes_used_by_mixdown() {
+        let rate = 1000;
+        let mut p = Project {
+            rate,
+            ..Project::default()
+        };
+        let mut voice = vec![0.0f32; 6000];
+        voice[2000..3000].iter_mut().for_each(|x| *x = 0.5);
+        p.add_track("voice", vec![voice]);
+        p.add_track("music", vec![vec![0.5; 6000]]);
+        let params = crate::dsp::duck::DuckParams::default();
+        assert_eq!(p.auto_duck(0, &[1], &params, false), Ok(1));
+        assert!(p.tracks[0].envelope.is_empty());
+        let mix = p.mixdown(0, 6000, false);
+        assert!(
+            (mix[0][500] - 0.5).abs() < 1e-6,
+            "music at full level before speech"
+        );
+        let ducked = 0.5 * 10f32.powf(-12.0 / 20.0);
+        assert!(
+            (mix[0][2500] - 0.5 - ducked).abs() < 1e-4,
+            "voice + ducked music"
+        );
+        assert!(p.undo());
+        assert!(p.tracks[1].envelope.is_empty());
+        assert!(p.auto_duck(0, &[0], &params, false).is_err());
     }
 
     #[test]

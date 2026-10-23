@@ -75,6 +75,10 @@ impl TranscriptState {
         eframe::set_value(storage, KEY_LANG, &self.language);
     }
 
+    pub fn python(&self) -> &str {
+        &self.python
+    }
+
     pub fn running(&self) -> bool {
         self.job.is_some()
     }

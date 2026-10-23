@@ -11,9 +11,46 @@ cd C:\Users\sales\Rust-Audacity
 cargo build --release --bin rust_audacity_mcp
 ```
 
-This produces `target\release\rust_audacity_mcp.exe`. Running `cargo build --release` builds both the app and the server.
+This produces `target\release\rust_audacity_mcp.exe`. Running `cargo build --release` builds both the app and the server. You only need it for clients that start servers as programs (Claude Desktop, `rust_audacity_chat`); everything else can use the server built into the app (above).
 
-## Connect it to an agent
+## Built into the app (HTTP), the easiest way
+
+While Rust Audacity is open, it serves the same 22 tools over **Streamable HTTP** at
+
+```
+http://127.0.0.1:8765/mcp
+```
+
+so there's no separate program to configure. Open **Agents ▸ MCP Server Settings & Setup…** in the app:
+
+- **On/off and port.** Default port 8765.
+- **Access token.** On by default. Agents send it as `Authorization: Bearer <token>`. Use **Show** / **Copy** / **New token**.
+- **File access.** Allow any folder, or limit agents to one folder (like `--root`).
+- **Connect an agent.** Ready-to-copy setup for each client, with your token filled in:
+
+| Client | Setup |
+|---|---|
+| Claude Code | `claude mcp add --transport http --scope user rust-audacity http://127.0.0.1:8765/mcp --header "Authorization: Bearer <token>"` |
+| Cursor | `%USERPROFILE%\.cursor\mcp.json`: `{"mcpServers":{"rust-audacity":{"url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer <token>"}}}}` |
+| VS Code | `.vscode/mcp.json`: `{"servers":{"rust-audacity":{"type":"http","url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer <token>"}}}}` |
+| Claude Desktop | Claude Desktop can't connect to a local URL directly. Either use `rust_audacity_mcp.exe` (below) or the `mcp-remote` bridge, which needs Node.js. The app shows the exact JSON for that. |
+
+The status bar shows **MCP ●** while the server runs. It lights up blue and names the client and tool while an agent is working. Agents' changes in the window are normal undo steps.
+
+**Security:**
+
+- **Local only.** The server listens on 127.0.0.1, so only programs on your computer can reach it.
+- **Web pages are blocked.** It refuses requests whose `Host` or `Origin` isn't local, which prevents DNS-rebinding attacks.
+- **Token checks.** With the token on, requests without it get `401`.
+
+**Technical details:**
+
+- `POST /mcp` answers with JSON. When the client accepts `text/event-stream` and calls a tool, it answers with a short SSE stream instead, which carries progress notifications and then the result.
+- Notifications get `202`; `GET` returns `405`; `DELETE` ends a session.
+- Protocol versions 2025-03-26 and later are supported.
+- For scripted setups, the environment variables `RUST_AUDACITY_MCP_PORT` and `RUST_AUDACITY_MCP_TOKEN` set the port and token.
+
+## Connect it to an agent (stdio program)
 
 `--root` restricts the server to one folder. It's recommended: the agent can then only read and write audio inside that folder.
 
@@ -60,7 +97,7 @@ Use the same command and args in the client's MCP settings. The transport is **s
 | `apply_effects` | Apply a list of effects and/or a built-in chain (e.g. `"Podcast Voice"`) to a whole file or a time range, then write a new WAV. Reports loudness before and after. `noise_reduction` takes its profile from `noise_profile` or from the quietest 0.5 s automatically. |
 | `edit_audio` | Operations: trim, delete, silence, insert_silence, fade_in, fade_out, gain, reverse, remove_silence (shortens long pauses). |
 | `convert_audio` | Any format to WAV, FLAC, MP3 or Ogg Vorbis, with optional new sample rate, mono/stereo, bit depth and LUFS normalization. |
-| `mix_audio` | Mix several files with per-input gain, pan, offset and mute, e.g. recombine stems or put music under a voice. |
+| `mix_audio` | Mix several files with per-input gain, pan, offset and mute, e.g. recombine stems or put music under a voice. Give an input `duck_db` (e.g. −12) to auto-duck it under the others. |
 | `generate_audio` | Tone (sine/square/saw/triangle), noise (white/pink/brown) or silence. |
 | `separate_stems` | Split a song into stems as WAV files. `engine: "demucs"` gives 4 stems (vocals/drums/bass/other), 6 stems with `htdemucs_6s`, or 2 stems with `two_stems`; it needs `pip install -U demucs`, reports progress and can be cancelled. `engine: "builtin"` gives an instant vocals + instrumental split with nothing to install. |
 | `render_spectrogram` | Saves a PNG spectrogram and returns it as an image the agent can look at. |
@@ -77,7 +114,8 @@ These tools need the Rust Audacity app to be running (Agents ▸ "Allow AI agent
 | `app_select` | Set the time selection (seconds) and which tracks are selected; optional zoom. |
 | `app_edit` | cut, copy, paste, delete, silence, trim, duplicate, split_new, mix_and_render, select_all, remove_selected_tracks, undo, redo. |
 | `app_apply_effects` | Effects and/or a chain on the selection as one undo step. Waits, then reports loudness. |
-| `app_track` | Name, gain, pan, mute, solo, selected. |
+| `app_track` | Name, gain, pan, mute, solo, selected, and the volume envelope (`[[seconds, dB], …]`). |
+| `app_auto_duck` | Lower music under the voice track by writing envelope points. Uses transcript words when available; one undo step. |
 | `app_playback` | Play (from/to) or stop, through your speakers. |
 | `app_export` | Export the mix or the selection; the format comes from the extension. |
 | `app_save_project` | Save as `.rap`. |
@@ -195,6 +233,8 @@ The bridge was tested this way end to end: analyze → apply suggested effects �
 - "Make `track.flac` 48 kHz, 16-bit and −14 LUFS for streaming."
 - "Convert every WAV in this folder to 320 kbps MP3."
 - With the app open: "Transcribe the interview I have open, cut the off-topic part about the weather and all the ums, then make it −16 LUFS and export interview.mp3."
+- With the app open: "Duck the music under my voice by 15 dB and fade the music out over the last 5 seconds."
+- "Mix `voice.wav` with `bed.mp3` at −8 dB, ducked under the voice, into `episode.mp3`."
 - "Make subtitles for talk.mp4's audio" (`transcribe_audio` with `output: "talk.srt"`).
 
 ## Protocol details

@@ -2,11 +2,26 @@
 
 # Rust Audacity
 
+[![CI](https://github.com/rholmes69/Rust_audacity/actions/workflows/ci.yml/badge.svg)](https://github.com/rholmes69/Rust_audacity/actions/workflows/ci.yml)
+
 An Audacity-style audio editor written in Rust. It uses
 [egui/eframe](https://github.com/emilk/egui) for the UI, [cpal](https://github.com/RustAudio/cpal) for audio I/O,
 [Symphonia](https://github.com/pdeljanov/Symphonia) for decoding, [hound](https://github.com/ruuda/hound) for WAV writing,
 [flacenc](https://github.com/yotarok/flacenc-rs), [LAME](https://lame.sourceforge.io) and [libvorbis/aoTuV](https://github.com/ComunidadAylas/vorbis-rs)
 for FLAC/MP3/Ogg export, [realfft](https://github.com/HEnquist/realfft) for FFTs and [ebur128](https://github.com/sdroege/ebur128) for loudness.
+
+## Download (Windows)
+
+Get the latest zip from the [Releases page](https://github.com/rholmes69/Rust_audacity/releases), unzip it anywhere and run `rust_audacity.exe`. To get a desktop icon, double-click `Create Desktop Shortcut.bat`. No Rust install is needed.
+
+Every push to `main` is built and tested on Windows and Linux by GitHub Actions. The Windows `.exe` files from each run can be downloaded from that run's page under **Artifacts**.
+
+**Publishing a release:** tag a version and push the tag. GitHub builds, tests, packages and publishes it automatically.
+
+```powershell
+git tag v0.5.0
+git push origin v0.5.0
+```
 
 ## Build & run (Windows)
 
@@ -143,6 +158,31 @@ The **transcript panel** (View ▸ Transcript Panel, Ctrl+Shift+T) shows the tex
 
 Words also appear along the bottom of the track's waveform. The transcript stays lined up through edits: cutting, pasting, trimming, time-shifting and tempo changes all move the words with the audio. It is part of undo and is saved in `.rap` projects.
 
+### Volume envelopes (Envelope tool, F2)
+
+Press **F2**, or click the **⌇** toolbar button, to draw volume changes on any track. Envelopes are written as points on an orange line; the 0, −12 and −24 dB lines are shown as a guide.
+
+- **Add a point:** click anywhere on the track.
+- **Move a point:** drag it. The status bar shows the level and time. Levels snap to 0 dB when you get close.
+- **Delete a point:** right-click it (or Alt+click).
+- **Remove the whole envelope:** Tracks ▸ Clear Envelope.
+
+Envelopes are applied during playback and export without changing the recorded audio. The points move with the audio when you cut, paste, trim, time-shift or change tempo. They are part of undo and are saved in `.rap` projects.
+
+### Auto Duck (Tracks ▸ Auto Duck…)
+
+Auto Duck lowers music automatically whenever someone speaks:
+
+1. Pick the voice track. The app guesses it: the transcribed track, or else the track with the most pauses.
+2. Pick the tracks to lower, and how much (12 dB by default).
+3. Click **Duck**.
+
+The fades are written as envelope points, so you can see them and fine-tune any of them with the Envelope tool. If the voice track has a transcript, its word timings are used to find the speech, which is the most accurate method. Otherwise the voice level is used, with an adjustable threshold. You can also set:
+
+- the fade-down and fade-up times;
+- "start early", which begins the dip just before the first word;
+- "stay down through pauses", which keeps the music from bouncing between sentences.
+
 ### Let an AI agent edit with you (Agents menu)
 
 While the app is open, AI agents connected through the Rust Audacity MCP server can work in this window using the `app_*` tools. They can open files, select, edit, apply effects, play, transcribe and cut words, export and save, and you watch it happen. Every change is a normal undo step.
@@ -153,11 +193,17 @@ While the app is open, AI agents connected through the Rust Audacity MCP server 
 
 ## Use it from AI agents (MCP server)
 
-`rust_audacity_mcp` is a second program built from the same engine. It lets AI agents such as Claude Desktop, Claude Code and Cursor analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. It also lets them drive the open Rust Audacity window through the `app_*` tools.
+Rust Audacity has a Model Context Protocol server with 22 tools. AI agents can use it to analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. With the `app_*` tools they can also drive the open window. The server comes in two forms, with exactly the same tools:
 
-```powershell
-cargo build --release --bin rust_audacity_mcp
-```
+- **Built into the app (HTTP).** It runs whenever Rust Audacity is open, at `http://127.0.0.1:8765/mcp`.
+  - **Agents ▸ MCP Server Settings & Setup…** shows the address and the access token, and lets you limit agents to one folder.
+  - The same window has ready-to-copy setup for Claude Code, Cursor/Windsurf, VS Code and Claude Desktop.
+  - The status bar shows `MCP ●`; it lights up and names the client and tool while an agent is working.
+- **`rust_audacity_mcp.exe` (stdio).** This is for clients that start the server themselves, such as Claude Desktop and `rust_audacity_chat`. Build it with:
+
+  ```powershell
+  cargo build --release --bin rust_audacity_mcp
+  ```
 
 Setup and the full tool list are in [MCP.md](MCP.md).
 
@@ -175,7 +221,7 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 | Ctrl+N / Ctrl+O | New project / Open project |
 | Ctrl+S / Ctrl+Shift+S | Save project / Save As |
 | Ctrl+Shift+I / Ctrl+Shift+E | Import audio / Export audio |
-| F1 / F5 | Selection tool / Time Shift tool |
+| F1 / F2 / F5 | Selection / Envelope / Time Shift tool |
 | Ctrl+Shift+T | Show / hide the transcript panel |
 
 ## Code layout
@@ -183,7 +229,7 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 ```
 src/
   lib.rs             audio engine library shared by the app and the MCP server
-  bin/rust_audacity_mcp/  MCP server (main.rs = protocol, tools.rs = file tools, app_tools.rs = app_* tools)
+  bin/rust_audacity_mcp/  stdio MCP server (a thin wrapper around src/mcp)
   bin/rust_audacity_chat.rs  terminal chat that connects an Ollama model to the MCP server
   main.rs            window setup
   app.rs             main UI: menus, transport, tracks, waveform/spectrogram, dialogs
@@ -194,7 +240,14 @@ src/
   app/file_ui.rs     project Open/Save, "save changes?" prompt, export dialog
   app/transcript_ui.rs  Transcribe dialog, transcript panel, text-based editing
   app/bridge_ui.rs   runs agent commands in the window
+  app/mcp_ui.rs      built-in MCP server: start/stop, settings & setup window, status
+  mcp/               MCP protocol + all tools, shared by the app (HTTP) and rust_audacity_mcp (stdio)
+    mod.rs           JSON-RPC handling, progress, cancellation
+    http.rs          Streamable HTTP transport (localhost, token, Host/Origin checks)
+    tools.rs         file tools; app_tools.rs = app_* tools
+  app/envelope_ui.rs Envelope tool, envelope drawing, Auto Duck dialog
   projectfile.rs     .rap project file format (save/load)
+  envelope.rs        volume envelope points (interpolation, follow edits)
   transcript.rs      word timings that follow edits, fillers, SRT/TXT
   whisper.rs         runs Whisper (whisper_runner.py) and parses its output
   bridge.rs          localhost agent bridge (server in the app, client in the MCP server)
@@ -212,12 +265,14 @@ src/
     space.rs         reverb, stereo width, vocal remover
     analysis.rs      LUFS/LRA/true-peak, spectrum
     separation.rs    built-in centre extraction, Demucs runner
+    duck.rs          speech detection and ducking envelopes
+.github/workflows/   CI (build/test/clippy on Windows + Linux) and tag-triggered releases
   project.rs         tracks, selection, undo, edits, time shift
   fileio.rs          import (Symphonia) and WAV/FLAC/MP3/Ogg export
   track.rs, engine.rs, waveform.rs
 ```
 
-Run `cargo test` to run the 64 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), and the agent bridge round-trips and rejects wrong tokens.
+Run `cargo test` to run the 71 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), the agent bridge round-trips and rejects wrong tokens, envelopes follow edits, Auto Duck lowers music only while speech is present, and the HTTP MCP server enforces its token and rejects requests from web pages.
 
 ## Known limitations
 
@@ -226,7 +281,9 @@ Run `cargo test` to run the 64 unit tests. They cover every DSP block, for examp
 - Resampling uses linear interpolation.
 - Whisper word times are accurate to roughly a tenth of a second. Cutting a word can occasionally clip the start of the next one; undo and select a little less if so.
 - Transcription covers one track at a time.
-- Not built yet: envelopes, editable labels, choosing audio devices, and metadata tags on export.
+- The waveform is drawn without the envelope applied; the orange line shows the level.
+- Envelope changes made while audio is playing are heard from the next time you press Play.
+- Not built yet: editable labels, choosing audio devices, and metadata tags on export.
 
 ## Licences of bundled encoders
 

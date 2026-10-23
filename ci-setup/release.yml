@@ -1,0 +1,57 @@
+# Publishes a GitHub Release with a ready-to-run Windows zip when a version tag is pushed:
+#   git tag v0.5.0
+#   git push origin v0.5.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "RustAudacity-${{ github.ref_name }}-windows-x64"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force -Path "$dir/mcp" | Out-Null
+          Copy-Item target/release/rust_audacity.exe, target/release/rust_audacity_mcp.exe, target/release/rust_audacity_chat.exe $dir
+          Copy-Item README.md, MCP.md, "Create Desktop Shortcut.bat" $dir
+          Copy-Item mcp/claude_desktop_config.example.json, mcp/chat_with_ollama.bat "$dir/mcp"
+          New-Item -ItemType Directory -Force -Path "$dir/assets" | Out-Null
+          Copy-Item assets/rust_audacity.ico, assets/rust_audacity_logo.png "$dir/assets"
+          Compress-Archive -Path "$dir/*" -DestinationPath "dist/$name.zip"
+          "ZIP=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
+          body: |
+            **Download** the zip below, unzip it anywhere and run `rust_audacity.exe`
+            (double-click `Create Desktop Shortcut.bat` for a desktop icon).
+
+            Optional extras: `pip install -U faster-whisper` for transcription,
+            `pip install -U demucs` for AI stem separation. See README.md and MCP.md.

@@ -75,6 +75,10 @@ impl StemsState {
     pub fn save(&self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, KEY_CMD, &self.command);
     }
+
+    pub fn demucs_command(&self) -> &str {
+        &self.command
+    }
 }
 
 fn title_case(s: &str) -> String {
