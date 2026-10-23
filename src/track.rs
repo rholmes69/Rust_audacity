@@ -7,7 +7,30 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::envelope::Envelope;
+
+/// A clip: a named, separately movable piece of audio on a track. Clips never overlap;
+/// the space between them (a gap) is silent. Positions are samples into the track.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    pub start: usize,
+    pub end: usize,
+    pub name: String,
+}
+
+impl Clip {
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+    pub fn contains(&self, pos: usize) -> bool {
+        self.start <= pos && pos < self.end
+    }
+}
 
 pub type Channel = Arc<Vec<f32>>;
 
@@ -38,6 +61,10 @@ pub struct Track {
     pub view: TrackView,
     /// Volume automation (empty = flat 0 dB). Applied on playback and mixdown.
     pub envelope: Envelope,
+    /// Clips, sorted and non-overlapping. Audio outside every clip is silence.
+    pub clips: Vec<Clip>,
+    /// Live effect rack, applied on playback and export without changing the audio.
+    pub live_fx: Vec<crate::dsp::realtime::LiveFx>,
 }
 
 impl Track {
@@ -50,10 +77,22 @@ impl Track {
                 c.resize(len, 0.0);
                 Arc::new(c)
             })
-            .collect();
+            .collect::<Vec<Channel>>();
+        let name = name.into();
+        let clips = if len > 0 {
+            vec![Clip {
+                start: 0,
+                end: len,
+                name: name.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
         Self {
             id,
-            name: name.into(),
+            name,
+            clips,
+            live_fx: Vec::new(),
             channels,
             gain: 1.0,
             pan: 0.0,
@@ -94,6 +133,7 @@ impl Track {
     pub fn remove(&mut self, start: usize, end: usize) {
         if let Some((s, e)) = self.raw_remove(start, end) {
             self.envelope.retime(s, e, s);
+            retime_clips(&mut self.clips, s, e, s);
         }
     }
 
@@ -111,12 +151,158 @@ impl Track {
 
     /// Insert audio at `pos` (later audio shifts right). Pads with silence if
     /// `pos` is past the end. Channel counts are adapted (mono<->stereo).
+    /// Inserting inside (or at either edge of) a clip makes that clip longer; inserting
+    /// in a gap makes a new clip.
     pub fn insert(&mut self, pos: usize, data: &[Vec<f32>]) {
         let len = self.len();
         let n = self.raw_insert(pos, data);
         if n > 0 && pos < len {
             self.envelope.retime(pos, pos, pos + n);
         }
+        if n > 0 {
+            self.clips_insert(pos, n);
+        }
+    }
+
+    /// Insert `n` samples of silence at `pos` without growing any clip (clips at or after
+    /// `pos` just move right). Used to move a whole track later in time.
+    pub fn insert_gap(&mut self, pos: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let len = self.len();
+        let ch = self.num_channels();
+        self.raw_insert(pos, &vec![vec![0.0; n]; ch]);
+        if pos < len {
+            self.envelope.retime(pos, pos, pos + n);
+        }
+        for c in &mut self.clips {
+            if c.start >= pos {
+                c.start += n;
+                c.end += n;
+            } else if c.end > pos {
+                c.end += n;
+            }
+        }
+    }
+
+    fn clips_insert(&mut self, pos: usize, n: usize) {
+        let host = self
+            .clips
+            .iter()
+            .position(|c| c.start <= pos && pos <= c.end);
+        for (i, c) in self.clips.iter_mut().enumerate() {
+            if Some(i) == host {
+                c.end += n;
+            } else if c.start >= pos {
+                c.start += n;
+                c.end += n;
+            }
+        }
+        if host.is_none() {
+            self.add_clip(pos, pos + n, None);
+        }
+    }
+
+    /// Make `[start, end)` one clip, replacing whatever clip coverage was there. With no
+    /// name, it takes the name of the clip it overlaps (or the track's).
+    pub fn add_clip(&mut self, start: usize, end: usize, name: Option<String>) {
+        if end <= start {
+            return;
+        }
+        let name = name.unwrap_or_else(|| {
+            self.clips
+                .iter()
+                .find(|c| c.start < end && start < c.end)
+                .map_or_else(|| self.name.clone(), |c| c.name.clone())
+        });
+        self.cut_clips(start, end);
+        self.clips.push(Clip { start, end, name });
+        self.clips.sort_by_key(|c| c.start);
+    }
+
+    /// Remove `[start, end)` from the clips (splitting a clip that spans it). The audio is
+    /// left as it is.
+    pub fn cut_clips(&mut self, start: usize, end: usize) {
+        let mut out = Vec::with_capacity(self.clips.len() + 1);
+        for c in self.clips.drain(..) {
+            if c.end <= start || c.start >= end {
+                out.push(c);
+                continue;
+            }
+            if c.start < start {
+                out.push(Clip {
+                    start: c.start,
+                    end: start,
+                    name: c.name.clone(),
+                });
+            }
+            if c.end > end {
+                out.push(Clip {
+                    start: end,
+                    end: c.end,
+                    name: c.name,
+                });
+            }
+        }
+        self.clips = out;
+    }
+
+    /// Split the clip under `pos` in two. Returns false if `pos` isn't strictly inside a clip.
+    pub fn split_clip_at(&mut self, pos: usize) -> bool {
+        let Some(i) = self.clips.iter().position(|c| c.start < pos && pos < c.end) else {
+            return false;
+        };
+        let c = self.clips[i].clone();
+        self.clips[i].end = pos;
+        self.clips.insert(
+            i + 1,
+            Clip {
+                start: pos,
+                end: c.end,
+                name: c.name,
+            },
+        );
+        true
+    }
+
+    /// Join every clip that touches `[start, end)` into one (gaps between them become part
+    /// of the clip). Returns false if fewer than two clips were involved.
+    pub fn join_clips(&mut self, start: usize, end: usize) -> bool {
+        let hit: Vec<usize> = (0..self.clips.len())
+            .filter(|&i| self.clips[i].start <= end && start <= self.clips[i].end)
+            .collect();
+        if hit.len() < 2 {
+            return false;
+        }
+        let s = self.clips[hit[0]].start;
+        let e = self.clips[*hit.last().unwrap()].end;
+        let name = self.clips[hit[0]].name.clone();
+        self.add_clip(s, e, Some(name));
+        true
+    }
+
+    /// The clip at `pos`, if any.
+    pub fn clip_at(&self, pos: usize) -> Option<usize> {
+        self.clips.iter().position(|c| c.contains(pos))
+    }
+
+    /// Keep clips sorted, inside the audio and non-empty (e.g. after loading a project).
+    pub fn normalize_clips(&mut self) {
+        let len = self.len();
+        for c in &mut self.clips {
+            c.end = c.end.min(len);
+            c.start = c.start.min(c.end);
+        }
+        self.clips.retain(|c| c.end > c.start);
+        self.clips.sort_by_key(|c| c.start);
+        for i in 1..self.clips.len() {
+            let prev_end = self.clips[i - 1].end;
+            let c = &mut self.clips[i];
+            c.start = c.start.max(prev_end);
+            c.end = c.end.max(c.start);
+        }
+        self.clips.retain(|c| c.end > c.start);
     }
 
     fn raw_insert(&mut self, pos: usize, data: &[Vec<f32>]) -> usize {
@@ -167,6 +353,32 @@ impl Track {
         if start <= len {
             self.envelope.retime(s, e, s + n);
         }
+        if s < e {
+            retime_clips(&mut self.clips, s, e, s + n);
+            // Audio written over a gap belongs to a clip.
+            if n > 0 && !self.clips.iter().any(|c| c.start <= s && s + n <= c.end) {
+                let covered: Vec<(usize, usize)> = self
+                    .clips
+                    .iter()
+                    .map(|c| (c.start, c.end))
+                    .filter(|&(a, b)| a < s + n && s < b)
+                    .collect();
+                let lo = covered.iter().map(|c| c.0).min().unwrap_or(s).min(s);
+                let hi = covered
+                    .iter()
+                    .map(|c| c.1)
+                    .max()
+                    .unwrap_or(s + n)
+                    .max(s + n);
+                self.add_clip(lo, hi, None);
+            }
+        } else if n > 0 {
+            self.clips_insert(start.min(len), n);
+            if start > len {
+                // Padding before the inserted audio is a gap, not part of the clip.
+                self.cut_clips(len, start);
+            }
+        }
     }
 
     /// Ensure all channels are at least `len` samples long.
@@ -185,6 +397,35 @@ impl Track {
         let r = if self.pan < 0.0 { 1.0 + self.pan } else { 1.0 };
         (self.gain * l, self.gain * r)
     }
+}
+
+/// Move clip edges for an edit that turned `[start, old_end)` into `[start, new_end)`.
+/// Positions inside the range scale; clips that end up empty are removed.
+pub fn retime_clips(clips: &mut Vec<Clip>, start: usize, old_end: usize, new_end: usize) {
+    if old_end == new_end {
+        return;
+    }
+    let old_len = (old_end - start) as f64;
+    let new_len = (new_end - start) as f64;
+    let map = |p: usize| -> usize {
+        if p < start {
+            p
+        } else if p >= old_end {
+            p + new_end - old_end
+        } else {
+            start + ((p - start) as f64 * new_len / old_len.max(1.0)).round() as usize
+        }
+    };
+    for c in clips.iter_mut() {
+        c.start = map(c.start);
+        // An end exactly at the edit's end belongs to the edited audio.
+        c.end = if c.end == old_end {
+            new_end
+        } else {
+            map(c.end)
+        };
+    }
+    clips.retain(|c| c.end > c.start);
 }
 
 /// Convert audio to a target channel count: mono→N duplicates, N→mono averages,

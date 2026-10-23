@@ -125,6 +125,7 @@ impl AudacityApp {
         if self.busy() {
             return;
         }
+        self.capture_plugin_states();
         let (s, e) = if selection_only && !self.project.selection.is_empty() {
             (self.project.selection.start, self.project.selection.end)
         } else {
@@ -191,6 +192,7 @@ impl AudacityApp {
         if self.busy() {
             return Err("Rust Audacity is busy.".into());
         }
+        self.capture_plugin_states();
         let regions =
             crate::labels::export_regions(&self.project.labels, self.project.len(), before_first);
         if regions.is_empty() {

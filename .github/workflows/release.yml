@@ -44,14 +44,30 @@ jobs:
           Compress-Archive -Path "$dir/*" -DestinationPath "dist/$name.zip"
           "ZIP=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          & $iscc "/DAppVersion=$v" installer\rust_audacity.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "SETUP=dist/RustAudacity-$v-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP }}
+          files: |
+            ${{ env.SETUP }}
+            ${{ env.ZIP }}
           generate_release_notes: true
           body: |
-            **Download** the zip below, unzip it anywhere and run `rust_audacity.exe`
+            **Download** `RustAudacity-…-setup.exe` below and run it: it adds Rust Audacity to the
+            Start menu, can open `.rap` projects and audio files with a double-click, and has an
+            uninstaller. Prefer no installer? Use the zip: unzip anywhere and run `rust_audacity.exe`
             (double-click `Create Desktop Shortcut.bat` for a desktop icon).
+
+            Rust Audacity checks for new versions (Help ▸ Check for Updates).
 
             Optional extras: `pip install -U faster-whisper` for transcription,
             `pip install -U demucs` for AI stem separation. See README.md and MCP.md.

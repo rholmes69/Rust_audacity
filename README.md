@@ -12,15 +12,20 @@ for FLAC/MP3/Ogg export, [realfft](https://github.com/HEnquist/realfft) for FFTs
 
 ## Download (Windows)
 
-Get the latest zip from the [Releases page](https://github.com/rholmes69/Rust_audacity/releases), unzip it anywhere and run `rust_audacity.exe`. To get a desktop icon, double-click `Create Desktop Shortcut.bat`. No Rust install is needed.
+Get the latest version from the [Releases page](https://github.com/rholmes69/Rust_audacity/releases):
+
+- **`RustAudacity-…-setup.exe`** installs it (no admin rights needed): Start-menu entry, optional desktop icon, double-click `.rap` projects to open them, "Open with ▸ Rust Audacity" for audio files, and an uninstaller.
+- Or the **zip**: unzip anywhere and run `rust_audacity.exe` (double-click `Create Desktop Shortcut.bat` for a desktop icon).
+
+No Rust install is needed. **Help ▸ Check for Updates** tells you when a new version is out (it also checks once a day; you can turn that off).
 
 Every push to `main` is built and tested on Windows and Linux by GitHub Actions. The Windows `.exe` files from each run can be downloaded from that run's page under **Artifacts**.
 
-**Publishing a release:** tag a version and push the tag. GitHub builds, tests, packages and publishes it automatically.
+**Publishing a release:** tag a version and push the tag. GitHub builds, tests, packages the zip and the installer (`installer/rust_audacity.iss`, Inno Setup), and publishes them.
 
 ```powershell
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.8.0
+git push origin v0.8.0
 ```
 
 ## Build & run (Windows)
@@ -65,7 +70,50 @@ On Linux you also need `libasound2-dev`, `libgtk-3-dev`, `libxkbcommon-dev` and 
 - **Recording:** records from the microphone, with overdub.
 - **Editing:** cut, copy, paste, delete, silence, trim, duplicate and split, with 100-step undo.
 - **Tracks:** multiple tracks with gain, pan, mute and solo.
+- **Clips:** a track can hold several separate pieces of audio with gaps between them, each with a name bar.
+  - **Split** at the cursor or at both ends of the selection (Ctrl+I); **Join** the clips the selection touches (Ctrl+J).
+  - **Drag a clip's name bar** to move it, also onto another track; with the Time Shift tool you can drag the clip itself. Clips stop next to each other instead of overlapping.
+  - Click the name bar to select the clip, double-click to rename it, right-click for Play / Split / Join / Delete.
+  - Pasting into a gap makes a new clip; recordings and imports are clips too.
+- **Autosave and crash recovery:** unsaved changes are saved in the background every minute (Preferences ▸ Projects). If the app or the computer crashes, the next start offers to recover them.
+- **Open Recent** (File menu) lists your recent projects and audio files.
+- **Light and dark themes** (Preferences ▸ Appearance), or follow the system setting.
+- **Your own keyboard shortcuts** (Preferences ▸ Keyboard): change, clear or reset any command's keys; Help ▸ Keyboard Shortcuts lists the current ones.
 - **Audio devices (Edit ▸ Preferences, Ctrl+P):** choose the playback and recording device, mono or stereo recording and the buffer size (lower = less latency). **Monitor input** shows your microphone level without recording so you can set your gain, and **Test playback** plays a short tone. If a saved device is unplugged, the system default is used and you're told.
+
+### Live effects (the FX button on each track)
+
+Each track has a rack of effects that you **hear while playing**, without changing the audio: EQ, bass & treble, compressor, limiter, noise gate, de-esser, hum removal, low/high-pass, echo, reverb, distortion, stereo widener, vocal remover, amplify, plus VST3/CLAP plugins.
+
+- Settings can be changed while the audio plays, and you hear the change straight away.
+- Untick an effect to bypass it, use the arrows to change the order, and ✕ to remove it.
+- The rack is applied when you export or Mix and Render, so the file sounds exactly like playback. **Apply to audio** bakes it into the track (one undo step).
+- Racks are saved in the project.
+
+### VST3 and CLAP plugins (Effect ▸ Plugins…)
+
+1. Click **Scan for plugins**. It looks in the standard folders (on Windows `C:\Program Files\Common Files\VST3` and `…\CLAP`) plus any you add. Each plugin is checked in a separate process, so a broken one can't crash the app.
+2. Add a plugin to a track with the **FX** button ▸ Add.
+3. Adjust it with its sliders, or click **Open plugin window** for the plugin's own interface (Windows).
+
+The plugin's settings are saved in the project and used for export. Effects only; instruments are listed but can't be used.
+
+### Spectral editing (Effect ▸ Spectral Edit)
+
+Switch a track to **Spectrum** view and drag a box over a sound: the box covers a time range *and* a frequency range. Then:
+
+- **Delete Frequencies** removes it (a whistle, a beep, a phone ringing);
+- **Reduce by … dB** turns it down;
+- **Heal** fills it with the sound around it (a cough, a chair squeak, a click);
+- **Isolate Frequencies** keeps only that band during the selection.
+
+The edges are faded in time and frequency so the edit doesn't click.
+
+### Assistant (Agents ▸ Assistant)
+
+Chat with a **local AI model** (via [Ollama](https://ollama.com)) that can use every Rust Audacity tool on the open project: "remove the hum and level the voice to −16 LUFS", "add a gentle reverb to track 2", "cut the silences longer than a second". Each tool it uses is shown in the conversation, and every change is a normal undo step.
+
+Install Ollama, run `ollama pull qwen3:8b` (or another model with tool support), and pick the model in the panel. Nothing leaves your computer.
 
 ### Labels and chapters
 
@@ -216,7 +264,7 @@ While the app is open, AI agents connected through the Rust Audacity MCP server 
 
 ## Use it from AI agents (MCP server)
 
-Rust Audacity has a Model Context Protocol server with 25 tools. AI agents can use it to analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. With the `app_*` tools they can also drive the open window. The server comes in two forms, with exactly the same tools:
+Rust Audacity has a Model Context Protocol server with 28 tools. AI agents can use it to analyze, clean up, edit, convert, mix, stem-separate and transcribe audio files. With the `app_*` tools they can also drive the open window. The server comes in two forms, with exactly the same tools:
 
 - **Built into the app (HTTP).** It runs whenever Rust Audacity is open, at `http://127.0.0.1:8765/mcp`.
   - **Agents ▸ MCP Server Settings & Setup…** shows the address and the access token, and lets you limit agents to one folder.
@@ -234,6 +282,8 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 
 ## Keyboard shortcuts
 
+These are the defaults; change them in Edit ▸ Preferences ▸ Keyboard.
+
 | Key | Action |
 |---|---|
 | Space / P / R / L | Play–Stop / Pause / Record / Loop |
@@ -247,6 +297,7 @@ To use a **local Ollama model** instead, run `rust_audacity_chat --model qwen3:8
 | F1 / F2 / F5 | Selection / Envelope / Time Shift tool |
 | Ctrl+Shift+T | Show / hide the transcript panel |
 | Ctrl+B / Ctrl+Shift+B | Add label / Labels window |
+| Ctrl+I / Ctrl+J | Split clip / Join clips |
 | Ctrl+P | Preferences (audio devices) |
 
 ## Code layout
@@ -275,6 +326,19 @@ src/
   app/labels_ui.rs   label strip, Labels window, export per label
   app/meta_ui.rs     Metadata window (tags, cover art)
   app/batch_ui.rs    Batch Process window
+  app/recovery_ui.rs autosave, crash recovery window, Open Recent
+  app/clips_ui.rs    clip name bars, dragging clips, clip menu
+  app/livefx_ui.rs   per-track live effect racks
+  app/plugins_ui.rs  plugin scanning, loading, sliders, plugin windows
+  app/spectral_ui.rs spectral box selection and Spectral Edit menu
+  app/theme.rs       light/dark themes;  app/keys.rs  customizable shortcuts
+  app/chat_ui.rs     Assistant panel (Ollama + the MCP tools in-process)
+  app/update_ui.rs   Help ▸ Check for Updates
+  recovery.rs        recovery sessions (lock files), recent files
+  ollama.rs          Ollama client and tool-calling loop (app + rust_audacity_chat)
+  plugins/           VST3 (vst3 crate) and CLAP (clack) hosting; win_editor.rs = plugin windows on Windows
+  dsp/realtime.rs    live effect processors (state kept across blocks) and racks
+  dsp/spectral.rs    spectral delete / reduce / heal / isolate
   labels.rs          labels that follow edits, export regions, chapters, Audacity .txt
   metadata.rs        tags, cover art and chapters for MP3 (ID3), FLAC, Ogg and WAV
   batch.rs           batch engine shared by the app and the batch_process MCP tool
@@ -303,20 +367,22 @@ src/
   engine.rs          playback/recording with device selection
   track.rs, waveform.rs
 .github/workflows/   CI (build/test/clippy on Windows + Linux) and tag-triggered releases
+installer/           Inno Setup script for the Windows installer
 ```
 
-Run `cargo test` to run the 77 unit tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), the agent bridge round-trips and rejects wrong tokens, envelopes follow edits, Auto Duck lowers music only while speech is present, the HTTP MCP server enforces its token and rejects requests from web pages, labels follow edits and undo, tags/cover/chapters read back correctly from all four export formats, and batch processing levels every file.
+Run `cargo test` to run the 92 tests. They cover every DSP block, for example: the limiter never exceeds its ceiling, noise reduction lowers noise while keeping a tone, pitch shift doubles the frequency without changing the length, separated stems sum back to the original, the Demucs command is checked with a stand-in script, projects save and reload bit-exactly, every export format decodes back correctly, background jobs commit as one undo step (or nothing if cancelled), time shifting never cuts audio, transcripts stay aligned through edits and undo, the Whisper pipeline works (with a stand-in model), the agent bridge round-trips and rejects wrong tokens, envelopes follow edits, Auto Duck lowers music only while speech is present, the HTTP MCP server enforces its token and rejects requests from web pages, labels follow edits and undo, tags/cover/chapters read back correctly from all four export formats, batch processing levels every file, crashed sessions are found (and live ones aren't), clips follow edits and never overlap, live effects give the same result in any block size and match the offline effects, playback mixing matches the exported mix, spectral edits change only their box, and rebinding a key moves it. If VST3/CLAP plugins are installed (on Ubuntu: `apt install dragonfly-reverb-vst3 dragonfly-reverb-clap`), a test loads one in each format, processes audio, and saves and restores its settings.
 
 ## Known limitations
 
-- Each track is one continuous clip, so a moved region overwrites what is at the destination rather than creating separate overlapping clips.
+- Clips can't overlap: a dragged clip stops next to its neighbour. Trimming a clip's edge isn't non-destructive yet (use Split and Delete Clip).
+- Plugin windows open on Windows only; on Linux and macOS use the sliders. VST3 plugins on macOS aren't supported yet.
+- A plugin is loaded on the UI thread when you add it, so a slow plugin can pause the window for a moment.
 - Progress for a single effect on a single track shows as "working…" rather than a percentage. Cancel takes effect immediately in the window; the worker finishes its current step in the background and the result is thrown away.
 - Resampling uses linear interpolation.
 - Whisper word times are accurate to roughly a tenth of a second. Cutting a word can occasionally clip the start of the next one; undo and select a little less if so.
 - Transcription covers one track at a time.
 - The waveform is drawn without the envelope applied; the orange line shows the level.
 - Envelope changes made while audio is playing are heard from the next time you press Play.
-- Not built yet: editable labels, choosing audio devices, and metadata tags on export.
 
 ## Licences of bundled encoders
 

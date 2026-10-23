@@ -133,6 +133,150 @@ pub fn reverb(
     out
 }
 
+/// Reverb that keeps running across blocks, for live playback.
+pub struct LiveReverb {
+    left: Tank,
+    right: Tank,
+    pre: Vec<f32>,
+    pre_idx: usize,
+    feedback: f32,
+    damp: f32,
+    wet: f32,
+    dry: f32,
+    w1: f32,
+    w2: f32,
+}
+
+impl LiveReverb {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        rate: f32,
+        room: f32,
+        damping: f32,
+        wet_db: f32,
+        dry_db: f32,
+        width: f32,
+        pre_delay_ms: f32,
+    ) -> Self {
+        let mut r = Self {
+            left: Tank::new(rate, 0),
+            right: Tank::new(rate, STEREO_SPREAD),
+            pre: Vec::new(),
+            pre_idx: 0,
+            feedback: 0.0,
+            damp: 0.0,
+            wet: 0.0,
+            dry: 0.0,
+            w1: 0.0,
+            w2: 0.0,
+        };
+        r.set(rate, room, damping, wet_db, dry_db, width, pre_delay_ms);
+        r
+    }
+
+    /// New settings; the tail keeps ringing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set(
+        &mut self,
+        rate: f32,
+        room: f32,
+        damping: f32,
+        wet_db: f32,
+        dry_db: f32,
+        width: f32,
+        pre_delay_ms: f32,
+    ) {
+        self.feedback = 0.7 + 0.28 * room.clamp(0.0, 1.0);
+        self.damp = damping.clamp(0.0, 1.0) * 0.4;
+        self.wet = 10f32.powf(wet_db / 20.0) * 0.015;
+        self.dry = if dry_db <= -60.0 {
+            0.0
+        } else {
+            10f32.powf(dry_db / 20.0)
+        };
+        let width = width.clamp(0.0, 1.0);
+        self.w1 = width / 2.0 + 0.5;
+        self.w2 = (1.0 - width) / 2.0;
+        let pre = (pre_delay_ms.max(0.0) * 0.001 * rate) as usize;
+        if pre != self.pre.len() {
+            self.pre = vec![0.0; pre];
+            self.pre_idx = 0;
+        }
+    }
+
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        let len = chans.first().map_or(0, Vec::len);
+        let stereo = chans.len() > 1;
+        for i in 0..len {
+            let input = if stereo {
+                (chans[0][i] + chans[1][i]) * 0.5
+            } else {
+                chans[0][i]
+            };
+            let mono_in = if self.pre.is_empty() {
+                input
+            } else {
+                let out = self.pre[self.pre_idx];
+                self.pre[self.pre_idx] = input;
+                self.pre_idx = (self.pre_idx + 1) % self.pre.len();
+                out
+            };
+            let l = self.left.tick(mono_in, self.feedback, self.damp);
+            let r = self.right.tick(mono_in, self.feedback, self.damp);
+            let (wl, wr) = (
+                (l * self.w1 + r * self.w2) * self.wet,
+                (r * self.w1 + l * self.w2) * self.wet,
+            );
+            if stereo {
+                chans[0][i] = chans[0][i] * self.dry + wl;
+                chans[1][i] = chans[1][i] * self.dry + wr;
+            } else {
+                chans[0][i] = chans[0][i] * self.dry + (wl + wr) * 0.5;
+            }
+        }
+    }
+}
+
+/// Vocal remover for live playback (keeps its bass filter state between blocks).
+pub struct LiveVocalRemover {
+    lp: [Biquad; 2],
+    keep: bool,
+}
+
+impl LiveVocalRemover {
+    pub fn new(rate: f32, keep_bass_hz: f32) -> Self {
+        let lp = Biquad::lowpass(keep_bass_hz.max(1.0), BUTTERWORTH_Q, rate);
+        Self {
+            lp: [lp, lp],
+            keep: keep_bass_hz > 0.0,
+        }
+    }
+    pub fn set(&mut self, rate: f32, keep_bass_hz: f32) {
+        let lp = Biquad::lowpass(keep_bass_hz.max(1.0), BUTTERWORTH_Q, rate);
+        self.lp[0].set_coefficients(&lp);
+        self.lp[1].set_coefficients(&lp);
+        self.keep = keep_bass_hz > 0.0;
+    }
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        if chans.len() < 2 {
+            return;
+        }
+        let (l, rest) = chans.split_at_mut(1);
+        for (a, b) in l[0].iter_mut().zip(rest[0].iter_mut()) {
+            let mid = (*a + *b) * 0.5;
+            let m = if self.keep {
+                let first = self.lp[0].tick(mid);
+                self.lp[1].tick(first)
+            } else {
+                0.0
+            };
+            let side = (*a - *b) * 0.5;
+            *a = m + side;
+            *b = m - side;
+        }
+    }
+}
+
 /// Mid/side stereo width. `width` 0 = mono, 1 = unchanged, 2 = extra wide.
 pub fn stereo_width(chans: &mut [Vec<f32>], width: f32, mid_db: f32, side_db: f32) -> bool {
     if chans.len() < 2 {

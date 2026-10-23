@@ -196,6 +196,22 @@ impl Project {
     // ----- transcript ----------------------------------------------------------
 
     /// Index of the track the transcript belongs to (if it still exists).
+    /// A copy of everything that is saved in a project file, without the undo history
+    /// or clipboard. Cheap: sample buffers are shared.
+    pub fn save_copy(&self) -> Project {
+        Project {
+            tracks: self.tracks.clone(),
+            rate: self.rate,
+            selection: self.selection,
+            transcript: self.transcript.clone(),
+            labels: self.labels.clone(),
+            metadata: self.metadata.clone(),
+            next_id: self.next_id,
+            revision: self.revision,
+            ..Default::default()
+        }
+    }
+
     pub fn transcript_track(&self) -> Option<usize> {
         let id = self.transcript.as_ref()?.track_id;
         self.tracks.iter().position(|t| t.id == id)
@@ -356,6 +372,25 @@ impl Project {
         self.tracks.len() - 1
     }
 
+    /// Add a track whose audio starts at `offset` (silence before it, one clip after).
+    pub fn add_track_at(
+        &mut self,
+        name: impl Into<String>,
+        mut channels: Vec<Vec<f32>>,
+        offset: usize,
+    ) -> usize {
+        let n = channels.first().map_or(0, Vec::len);
+        for ch in &mut channels {
+            ch.splice(0..0, std::iter::repeat_n(0.0, offset));
+        }
+        let idx = self.add_track(name, channels);
+        let t = &mut self.tracks[idx];
+        t.clips.clear();
+        let clip_name = t.name.clone();
+        t.add_clip(offset, offset + n, Some(clip_name));
+        idx
+    }
+
     /// Add audio recorded/imported at `rate`, resampling to the project rate.
     /// The first audio added to an empty project sets the project rate instead.
     pub fn add_audio(
@@ -475,11 +510,8 @@ impl Project {
                 let s = start.min(len);
                 self.retime_transcript(ti, s, end.min(len), s + clip_len);
             } else {
-                let mut padded = clip.clone();
-                for ch in &mut padded {
-                    ch.splice(0..0, std::iter::repeat_n(0.0, start));
-                }
-                let idx = self.add_track(format!("Pasted {}", self.next_id), padded);
+                let idx =
+                    self.add_track_at(format!("Pasted {}", self.next_id), clip.clone(), start);
                 self.tracks[idx].selected = true;
             }
         }
@@ -537,12 +569,9 @@ impl Project {
         self.push_undo("Duplicate");
         let Selection { start, end } = self.selection;
         for i in self.target_tracks() {
-            let mut data = self.tracks[i].extract(start, end);
-            for ch in &mut data {
-                ch.splice(0..0, std::iter::repeat_n(0.0, start));
-            }
+            let data = self.tracks[i].extract(start, end);
             let name = format!("{} (dup)", self.tracks[i].name);
-            self.add_track(name, data);
+            self.add_track_at(name, data, start);
         }
         true
     }
@@ -555,13 +584,11 @@ impl Project {
         self.push_undo("Split New");
         let Selection { start, end } = self.selection;
         for i in self.target_tracks() {
-            let mut data = self.tracks[i].extract(start, end);
+            let data = self.tracks[i].extract(start, end);
             self.tracks[i].silence(start, end);
-            for ch in &mut data {
-                ch.splice(0..0, std::iter::repeat_n(0.0, start));
-            }
+            self.tracks[i].cut_clips(start, end);
             let name = format!("{} (split)", self.tracks[i].name);
-            self.add_track(name, data);
+            self.add_track_at(name, data, start);
         }
         true
     }
@@ -596,8 +623,7 @@ impl Project {
         self.push_undo("Time Shift");
         let t = &mut self.tracks[idx];
         if delta > 0 {
-            let n = t.num_channels();
-            t.insert(0, &vec![vec![0.0; delta as usize]; n]);
+            t.insert_gap(0, delta as usize);
         } else {
             t.remove(0, (-delta) as usize);
         }
@@ -640,8 +666,20 @@ impl Project {
             .iter()
             .map(|&i| (i, self.tracks[i].extract(start, end)))
             .collect();
+        // The moved audio keeps the name of the clip it came from.
+        let names: Vec<Option<String>> = clips
+            .iter()
+            .map(|&(i, _)| {
+                let t = &self.tracks[i];
+                t.clips
+                    .iter()
+                    .find(|c| c.start < end && start < c.end)
+                    .map(|c| c.name.clone())
+            })
+            .collect();
         for &(i, _) in &clips {
             self.tracks[i].silence(start, end);
+            self.tracks[i].cut_clips(start, end);
         }
         // Words travel with their audio; words under the destination are overwritten.
         if let Some(tt) = self.transcript_track()
@@ -668,7 +706,7 @@ impl Project {
                 tr.words.sort_by_key(|w| w.start);
             }
         }
-        for (i, data) in clips {
+        for ((i, data), name) in clips.into_iter().zip(names) {
             let ti = dest_track.unwrap_or(i);
             let t = &mut self.tracks[ti];
             let data = crate::track::adapt_channels(&data, t.num_channels());
@@ -679,6 +717,9 @@ impl Project {
                 buf[..src.len().min(len)].copy_from_slice(&src[..src.len().min(len)]);
                 ch += 1;
             });
+            if name.is_some() {
+                t.add_clip(new_start, new_start + len, name);
+            }
         }
         if let Some(d) = dest_track {
             for (j, t) in self.tracks.iter_mut().enumerate() {
@@ -686,6 +727,227 @@ impl Project {
             }
         }
         self.selection = Selection::new(new_start, new_start + len);
+        true
+    }
+
+    // ----- clips ---------------------------------------------------------------
+
+    /// Where a clip of `len` samples can go on track `ti` nearest to `want`, without
+    /// overlapping another clip (`skip` = the clip being moved, on that same track).
+    pub fn clip_slot(&self, ti: usize, want: i64, len: usize, skip: Option<usize>) -> usize {
+        let want = want.max(0) as usize;
+        let others: Vec<(usize, usize)> = self.tracks[ti]
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| Some(i) != skip)
+            .map(|(_, c)| (c.start, c.end))
+            .collect();
+        // Free gaps: [prev_end, next_start), the last one unbounded.
+        let mut best: Option<usize> = None;
+        let mut prev_end = 0;
+        for k in 0..=others.len() {
+            let next_start = others.get(k).map_or(usize::MAX, |c| c.0);
+            if next_start.saturating_sub(prev_end) >= len {
+                let hi = next_start.saturating_sub(len);
+                let cand = want.clamp(prev_end, hi);
+                if best.is_none_or(|b| cand.abs_diff(want) < b.abs_diff(want)) {
+                    best = Some(cand);
+                }
+            }
+            if let Some(c) = others.get(k) {
+                prev_end = c.1;
+            }
+        }
+        best.unwrap_or(want)
+    }
+
+    /// Move clip `ci` of track `ti` by `delta` samples, optionally onto another track.
+    /// It stops next to other clips instead of overlapping them. Returns false if nothing
+    /// moved. The clip becomes the selection.
+    pub fn move_clip(&mut self, ti: usize, ci: usize, delta: i64, dest: Option<usize>) -> bool {
+        let Some(c) = self.tracks.get(ti).and_then(|t| t.clips.get(ci)).cloned() else {
+            return false;
+        };
+        let dest_t = dest.filter(|&d| d < self.tracks.len()).unwrap_or(ti);
+        let skip = (dest_t == ti).then_some(ci);
+        let ns = self.clip_slot(dest_t, c.start as i64 + delta, c.len(), skip);
+        if ns == c.start && dest_t == ti {
+            return false;
+        }
+        for (j, t) in self.tracks.iter_mut().enumerate() {
+            t.selected = j == ti;
+        }
+        self.selection = Selection::new(c.start, c.end);
+        let moved =
+            self.move_selection(ns as i64 - c.start as i64, (dest_t != ti).then_some(dest_t));
+        if moved {
+            // Restore the exact clip (move_selection names it after the source clip).
+            let t = &mut self.tracks[dest_t];
+            t.add_clip(ns, ns + c.len(), Some(c.name));
+        }
+        moved
+    }
+
+    /// Split clips at the cursor, or at both ends of the selection, on the target tracks.
+    pub fn split_clips(&mut self) -> bool {
+        let Selection { start, end } = self.selection;
+        let targets = self.target_tracks();
+        let hits = |t: &Track| {
+            t.clips
+                .iter()
+                .any(|c| (c.start < start && start < c.end) || (c.start < end && end < c.end))
+        };
+        if !targets.iter().any(|&i| hits(&self.tracks[i])) {
+            return false;
+        }
+        self.push_undo("Split Clip");
+        for i in targets {
+            let t = &mut self.tracks[i];
+            t.split_clip_at(start);
+            t.split_clip_at(end);
+        }
+        true
+    }
+
+    /// Join the clips touching the selection into one, on the target tracks.
+    pub fn join_clips(&mut self) -> bool {
+        let Selection { start, end } = self.selection;
+        let targets = self.target_tracks();
+        let touching = |t: &Track| {
+            t.clips
+                .iter()
+                .filter(|c| c.start <= end && start <= c.end)
+                .count()
+                >= 2
+        };
+        if !targets.iter().any(|&i| touching(&self.tracks[i])) {
+            return false;
+        }
+        self.push_undo("Join Clips");
+        for i in targets {
+            self.tracks[i].join_clips(start, end);
+        }
+        true
+    }
+
+    pub fn rename_clip(&mut self, ti: usize, ci: usize, name: impl Into<String>) -> bool {
+        let name = name.into();
+        let Some(c) = self.tracks.get(ti).and_then(|t| t.clips.get(ci)) else {
+            return false;
+        };
+        if c.name == name {
+            return false;
+        }
+        self.push_undo("Rename Clip");
+        self.tracks[ti].clips[ci].name = name;
+        true
+    }
+
+    /// Delete a clip, leaving a gap (later audio doesn't move).
+    pub fn delete_clip(&mut self, ti: usize, ci: usize) -> bool {
+        let Some(c) = self.tracks.get(ti).and_then(|t| t.clips.get(ci)).cloned() else {
+            return false;
+        };
+        self.push_undo("Delete Clip");
+        let t = &mut self.tracks[ti];
+        t.silence(c.start, c.end);
+        t.clips.remove(ci);
+        if let Some(tr) = self.transcript_for(ti) {
+            tr.drop_range(c.start, c.end);
+        }
+        true
+    }
+
+    // ----- spectral editing --------------------------------------------------------
+
+    /// Apply a spectral edit to the box (selection × [lo_hz, hi_hz]) on the target tracks.
+    pub fn spectral_edit(
+        &mut self,
+        lo_hz: f32,
+        hi_hz: f32,
+        op: crate::dsp::spectral::SpectralOp,
+    ) -> bool {
+        if self.selection.is_empty() || hi_hz <= lo_hz {
+            return false;
+        }
+        let Selection { start, end } = self.selection;
+        let targets: Vec<usize> = self
+            .target_tracks()
+            .into_iter()
+            .filter(|&i| self.tracks[i].len() > start)
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        self.push_undo(op.name());
+        let rate = self.rate;
+        for i in targets {
+            for c in self.tracks[i].channels.iter_mut() {
+                crate::dsp::spectral::apply(
+                    Arc::make_mut(c).as_mut_slice(),
+                    rate,
+                    start,
+                    end,
+                    lo_hz,
+                    hi_hz,
+                    op,
+                );
+            }
+        }
+        self.touch();
+        true
+    }
+
+    // ----- live effects ----------------------------------------------------------
+
+    /// Add a VST3/CLAP plugin to the end of track `ti`'s rack. Returns its slot id.
+    pub fn add_live_plugin(&mut self, ti: usize, desc: crate::plugins::PluginDesc) -> Option<u64> {
+        if ti >= self.tracks.len() {
+            return None;
+        }
+        self.push_undo("Add Plugin");
+        let id = self.alloc_id();
+        self.tracks[ti]
+            .live_fx
+            .push(crate::dsp::realtime::LiveFx::plugin(id, desc));
+        Some(id)
+    }
+
+    /// Add a live effect to the end of track `ti`'s rack. Returns its id.
+    pub fn add_live_fx(&mut self, ti: usize, effect: crate::effects::Effect) -> Option<u64> {
+        if ti >= self.tracks.len() || !crate::dsp::realtime::supports(&effect) {
+            return None;
+        }
+        self.push_undo("Add Live Effect");
+        let id = self.alloc_id();
+        self.tracks[ti]
+            .live_fx
+            .push(crate::dsp::realtime::LiveFx::builtin(id, effect));
+        Some(id)
+    }
+
+    /// Bake track `ti`'s live effects into its audio and empty the rack (one undo step).
+    pub fn render_live_fx(&mut self, ti: usize) -> bool {
+        let Some(t) = self.tracks.get(ti) else {
+            return false;
+        };
+        if !t.live_fx.iter().any(|f| f.enabled) || t.is_empty() {
+            return false;
+        }
+        self.push_undo("Apply Live Effects");
+        let rate = self.rate;
+        let t = &mut self.tracks[ti];
+        let len = t.len();
+        let n = t.num_channels();
+        let mut chans = t.extract(0, len);
+        // Racks process up to two channels; extra channels pass through.
+        let rest = chans.split_off(n.min(2));
+        let mut out = crate::dsp::realtime::render(&t.live_fx, chans, rate);
+        out.extend(rest);
+        t.channels = out.into_iter().map(Arc::new).collect();
+        t.live_fx.clear();
+        self.touch();
         true
     }
 
@@ -733,6 +995,27 @@ impl Project {
             let (gl, gr) = t.lr_gains();
             let tl = t.len();
             let env = t.envelope.gains(start, len.min(tl.saturating_sub(start)));
+            if t.live_fx.iter().any(|f| f.enabled) {
+                // Live effects: envelope first, then the rack, then gain/pan (as on playback).
+                let mut chans = t.extract(start, end);
+                chans.truncate(2);
+                if let Some(e) = &env {
+                    for c in chans.iter_mut() {
+                        c.iter_mut().zip(e).for_each(|(x, g)| *x *= g);
+                    }
+                }
+                let chans = crate::dsp::realtime::render(&t.live_fx, chans, self.rate);
+                let r = chans.get(1).unwrap_or(&chans[0]);
+                for (i, &l) in chans[0].iter().enumerate() {
+                    if stereo {
+                        out[0][i] += l * gl;
+                        out[1][i] += r[i] * gr;
+                    } else {
+                        out[0][i] += l * t.gain;
+                    }
+                }
+                continue;
+            }
             for i in 0..len {
                 let idx = start + i;
                 if idx >= tl {
@@ -947,6 +1230,115 @@ mod tests {
         assert_eq!(p.labels[1].start, 5000);
         assert!(p.undo() && p.undo());
         assert!(p.labels.is_empty());
+    }
+
+    #[test]
+    fn clips_follow_edits_move_without_overlap_and_undo() {
+        let mut p = Project {
+            rate: 100,
+            ..Default::default()
+        };
+        p.add_track("a", vec![(0..1000).map(|i| i as f32).collect()]);
+        assert_eq!(p.tracks[0].clips.len(), 1);
+        // Split at 300 and 600 → three clips.
+        p.selection = Selection::new(300, 600);
+        assert!(p.split_clips());
+        let spans = |p: &Project| {
+            p.tracks[0]
+                .clips
+                .iter()
+                .map(|c| (c.start, c.end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spans(&p), vec![(0, 300), (300, 600), (600, 1000)]);
+        // Move the last clip right: a gap opens; audio moves with it.
+        assert!(p.move_clip(0, 2, 200, None));
+        assert_eq!(spans(&p), vec![(0, 300), (300, 600), (800, 1200)]);
+        assert_eq!(p.tracks[0].channels[0][800], 600.0);
+        assert_eq!(p.tracks[0].channels[0][700], 0.0);
+        // Moving the middle clip right stops at the next clip instead of overlapping.
+        assert!(p.move_clip(0, 1, 300, None));
+        assert_eq!(spans(&p), vec![(0, 300), (500, 800), (800, 1200)]);
+        assert_eq!(p.tracks[0].channels[0][500], 300.0);
+        // ...and a big move skips to the nearest free space that fits.
+        assert!(p.move_clip(0, 0, 5000, None));
+        assert_eq!(spans(&p)[2], (5000, 5300));
+        assert_eq!(p.tracks[0].channels[0][5000], 0.0);
+        assert_eq!(p.tracks[0].channels[0][5001], 1.0);
+        p.undo();
+        assert_eq!(spans(&p), vec![(0, 300), (500, 800), (800, 1200)]);
+        // Deleting audio before a clip moves it left; deleting inside shrinks it.
+        p.selection = Selection::new(100, 200);
+        for t in &mut p.tracks {
+            t.selected = true;
+        }
+        assert!(p.delete());
+        assert_eq!(spans(&p), vec![(0, 200), (400, 700), (700, 1100)]);
+        // Pasting into a gap makes a new clip; pasting inside a clip makes it longer.
+        p.selection = Selection::new(0, 50);
+        p.copy();
+        p.selection = Selection::cursor(300);
+        p.paste();
+        assert_eq!(
+            spans(&p),
+            vec![(0, 200), (300, 350), (450, 750), (750, 1150)]
+        );
+        p.selection = Selection::cursor(100);
+        p.paste();
+        assert_eq!(spans(&p)[0], (0, 250));
+        // Join merges the clips the selection touches, gap included.
+        p.selection = Selection::new(200, 500);
+        assert!(p.join_clips());
+        assert_eq!(spans(&p), vec![(0, 800), (800, 1200)]);
+        // Time shift moves whole clips, never growing them.
+        p.shift_track(0, 100);
+        assert_eq!(spans(&p), vec![(100, 900), (900, 1300)]);
+        // Delete a clip: a gap, nothing moves.
+        assert!(p.delete_clip(0, 0));
+        assert_eq!(spans(&p), vec![(900, 1300)]);
+        assert_eq!(p.tracks[0].len(), 1300);
+    }
+
+    #[test]
+    fn duplicate_and_split_new_make_clips_at_the_right_place() {
+        let mut p = Project::default();
+        p.add_track("a", vec![vec![0.5; 1000]]);
+        p.selection = Selection::new(200, 500);
+        p.duplicate();
+        assert_eq!(p.tracks[1].clips[0].start, 200);
+        assert_eq!(p.tracks[1].clips[0].end, 500);
+        for (i, t) in p.tracks.iter_mut().enumerate() {
+            t.selected = i == 0;
+        }
+        p.split_new();
+        let c: Vec<(usize, usize)> = p.tracks[0].clips.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(c, vec![(0, 200), (500, 1000)]);
+        assert_eq!(
+            (p.tracks[2].clips[0].start, p.tracks[2].clips[0].end),
+            (200, 500)
+        );
+    }
+
+    #[test]
+    fn mixdown_applies_live_effects_after_envelope_and_before_gain() {
+        use crate::{dsp::realtime::LiveFx, effects::Effect};
+        let mut p = Project::default();
+        p.add_track("a", vec![vec![0.5; 1000]]);
+        p.tracks[0].gain = 0.5;
+        p.tracks[0]
+            .live_fx
+            .push(LiveFx::builtin(1, Effect::Amplify { db: 6.0206 }));
+        let m = p.mixdown(0, 1000, false);
+        assert!(
+            (m[0][500] - 0.5).abs() < 1e-3,
+            "0.5 × 2 (fx) × 0.5 (gain) = {}",
+            m[0][500]
+        );
+        p.tracks[0].live_fx[0].enabled = false;
+        let m = p.mixdown(0, 1000, false);
+        assert!((m[0][500] - 0.25).abs() < 1e-6);
+        // The audio itself is never changed.
+        assert_eq!(p.tracks[0].channels[0][500], 0.5);
     }
 
     #[test]

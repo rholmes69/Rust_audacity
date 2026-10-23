@@ -27,9 +27,9 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    time::Duration,
 };
 
+use rust_audacity::ollama::{Ollama, normalize_args, to_ollama_tools, truncate};
 use serde_json::{Value, json};
 
 type R<T> = Result<T, String>;
@@ -167,100 +167,7 @@ impl Drop for McpClient {
     }
 }
 
-// ---------------------------------------------------------------- Ollama
-
-struct Ollama {
-    agent: ureq::Agent,
-    base: String,
-}
-
-impl Ollama {
-    fn new(base: &str) -> Self {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(1800)))
-            .http_status_as_error(false)
-            .proxy(None) // Ollama is local; never route through a system proxy
-            .build()
-            .into();
-        Self {
-            agent,
-            base: base.trim_end_matches('/').to_string(),
-        }
-    }
-
-    fn get(&self, path: &str) -> R<Value> {
-        let mut resp = self
-            .agent
-            .get(&format!("{}{path}", self.base))
-            .call()
-            .map_err(|e| self.conn_err(e))?;
-        resp.body_mut()
-            .read_json::<Value>()
-            .map_err(|e| e.to_string())
-    }
-
-    fn chat(&self, body: &Value) -> R<Value> {
-        let mut resp = self
-            .agent
-            .post(&format!("{}/api/chat", self.base))
-            .send_json(body)
-            .map_err(|e| self.conn_err(e))?;
-        let status = resp.status();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| e.to_string())?;
-        let v: Value = serde_json::from_str(&text).unwrap_or(json!({ "error": text }));
-        if !status.is_success() || v.get("error").is_some() {
-            return Err(format!(
-                "Ollama error ({status}): {}",
-                v["error"].as_str().unwrap_or(&text)
-            ));
-        }
-        Ok(v)
-    }
-
-    fn conn_err(&self, e: ureq::Error) -> String {
-        format!(
-            "cannot reach Ollama at {} ({e}). Is Ollama running? Start it with `ollama serve` or the Ollama app.",
-            self.base
-        )
-    }
-}
-
-/// MCP tool definitions → Ollama/OpenAI-style function tools.
-fn to_ollama_tools(mcp_tools: &[Value]) -> Vec<Value> {
-    mcp_tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t.get("inputSchema").cloned().unwrap_or(json!({ "type": "object", "properties": {} })),
-                }
-            })
-        })
-        .collect()
-}
-
-/// Some models return arguments as a JSON string instead of an object.
-fn normalize_args(v: &Value) -> Value {
-    match v {
-        Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
-        Value::Null => json!({}),
-        other => other.clone(),
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}… [truncated]", s.chars().take(max).collect::<String>())
-    }
-}
+// Ollama client and helpers are shared with the app (rust_audacity::ollama).
 
 fn list_audio_files(root: &PathBuf) -> Vec<String> {
     let exts = [
@@ -329,15 +236,7 @@ fn parse_opts() -> R<Opts> {
         .unwrap_or_default();
     let mut o = Opts {
         model: "qwen3:8b".into(),
-        ollama: std::env::var("OLLAMA_HOST")
-            .map(|h| {
-                if h.starts_with("http") {
-                    h
-                } else {
-                    format!("http://{h}")
-                }
-            })
-            .unwrap_or_else(|_| "http://localhost:11434".into()),
+        ollama: rust_audacity::ollama::default_url(),
         root: std::env::current_dir().unwrap_or_default(),
         server: exe_dir.join(if cfg!(windows) {
             "rust_audacity_mcp.exe"

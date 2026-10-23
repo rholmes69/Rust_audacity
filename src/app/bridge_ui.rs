@@ -77,6 +77,14 @@ impl BridgeState {
     }
 }
 
+fn clips_json(r: u32, t: &crate::track::Track) -> Vec<Value> {
+    t.clips
+        .iter()
+        .enumerate()
+        .map(|(i, c)| json!({ "clip": i, "name": c.name, "start": secs(r, c.start), "end": secs(r, c.end) }))
+        .collect()
+}
+
 fn secs(rate: u32, samples: usize) -> f64 {
     (samples as f64 / rate as f64 * 1000.0).round() / 1000.0
 }
@@ -173,6 +181,8 @@ impl AudacityApp {
                     "solo": t.solo,
                     "selected": t.selected,
                     "envelope": t.envelope.points.iter().map(|p| json!([secs(r, p.pos), (p.db * 10.0).round() / 10.0])).collect::<Vec<_>>(),
+                    "clips": clips_json(r, t),
+                    "live_fx": t.live_fx.iter().map(|f| format!("{}{}", f.name(), if f.enabled { "" } else { " (bypassed)" })).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -687,6 +697,284 @@ impl AudacityApp {
                 self.project.push_undo("Envelope");
                 self.project.tracks[i].envelope = crate::envelope::Envelope::from_points(points);
                 Ok(json!({ "index": i, "points": self.project.tracks[i].envelope.points.len() }))
+            }
+            "spectral" => {
+                self.require_idle()?;
+                let lo = f(a, "low_hz").ok_or("missing `low_hz`")? as f32;
+                let hi = f(a, "high_hz").ok_or("missing `high_hz`")? as f32;
+                if hi <= lo {
+                    return Err("high_hz must be above low_hz".into());
+                }
+                let start = self.to_samples(f(a, "start").ok_or("missing `start` (seconds)")?);
+                let end = self.to_samples(f(a, "end").ok_or("missing `end` (seconds)")?);
+                if end <= start {
+                    return Err("end must be after start".into());
+                }
+                if let Some(ti) = a.get("track").and_then(Value::as_u64) {
+                    let ti = ti as usize;
+                    if ti >= self.project.tracks.len() {
+                        return Err(format!("no track {ti}"));
+                    }
+                    for (j, t) in self.project.tracks.iter_mut().enumerate() {
+                        t.selected = j == ti;
+                    }
+                }
+                let op = match s(a, "action").unwrap_or("delete") {
+                    "delete" => crate::dsp::spectral::SpectralOp::Delete,
+                    "reduce" => {
+                        crate::dsp::spectral::SpectralOp::Reduce(f(a, "db").unwrap_or(12.0) as f32)
+                    }
+                    "heal" => crate::dsp::spectral::SpectralOp::Heal,
+                    "isolate" => crate::dsp::spectral::SpectralOp::Isolate,
+                    o => return Err(format!("unknown action {o}")),
+                };
+                self.project.selection = Selection::new(start, end);
+                self.spectral.sel = Some((lo, hi));
+                self.engine.stop_playback();
+                if !self.project.spectral_edit(lo, hi, op) {
+                    return Err("nothing to edit there".into());
+                }
+                self.status = format!("Agent: {}", op.name());
+                Ok(
+                    json!({ "applied": op.name(), "start": f(a, "start"), "end": f(a, "end"), "low_hz": lo, "high_hz": hi }),
+                )
+            }
+            "live_fx" => {
+                let ti = a
+                    .get("track")
+                    .and_then(Value::as_u64)
+                    .map_or(0, |x| x as usize);
+                if ti >= self.project.tracks.len() {
+                    return Err(format!("no track {ti}"));
+                }
+                let slot = a.get("slot").and_then(Value::as_u64).map(|x| x as usize);
+                let n = self.project.tracks[ti].live_fx.len();
+                let need_slot = || -> Result<usize, String> {
+                    let k = slot.ok_or("missing `slot` (see action=list)")?;
+                    if k >= n {
+                        return Err(format!("track {ti} has no live effect slot {k}"));
+                    }
+                    Ok(k)
+                };
+                let effect = || -> Result<Effect, String> {
+                    serde_json::from_value(a.get("effect").cloned().ok_or("missing `effect`")?)
+                        .map_err(|e| format!("bad effect: {e}"))
+                };
+                match s(a, "action").unwrap_or("list") {
+                    "list" => {}
+                    "add" if a.get("plugin").is_some() => {
+                        let want = s(a, "plugin")
+                            .ok_or("`plugin` must be a name")?
+                            .to_lowercase();
+                        let fmt = s(a, "format").map(str::to_lowercase);
+                        let found = self
+                            .plugins
+                            .effects()
+                            .filter(|d| {
+                                fmt.as_deref()
+                                    .is_none_or(|f| d.format.label().to_lowercase() == f)
+                            })
+                            .find(|d| d.name.to_lowercase() == want)
+                            .or_else(|| {
+                                self.plugins
+                                    .effects()
+                                    .find(|d| d.name.to_lowercase().contains(&want))
+                            })
+                            .cloned();
+                        let Some(desc) = found else {
+                            let names: Vec<String> = self
+                                .plugins
+                                .effects()
+                                .map(|d| format!("{} ({})", d.name, d.format.label()))
+                                .collect();
+                            return Err(if names.is_empty() {
+                                "no plugins found yet: the user can scan in Effect ▸ Plugins…"
+                                    .into()
+                            } else {
+                                format!("no plugin named “{want}”. Installed: {}", names.join(", "))
+                            });
+                        };
+                        self.project.add_live_plugin(ti, desc);
+                        // Load it now so its parameters can be listed right away.
+                        self.sync_plugins();
+                    }
+                    "set_param" => {
+                        let k = need_slot()?;
+                        let id = self.project.tracks[ti].live_fx[k].id;
+                        let p = self
+                            .plugins
+                            .loaded
+                            .get_mut(&id)
+                            .ok_or("that slot isn't a loaded plugin")?;
+                        let params = p.params();
+                        let key = a.get("param").ok_or("missing `param` (name or id)")?;
+                        let q = params
+                            .iter()
+                            .find(|q| match key {
+                                Value::Number(n) => n.as_u64() == Some(q.id as u64),
+                                Value::String(n) => q.name.eq_ignore_ascii_case(n),
+                                _ => false,
+                            })
+                            .ok_or("no such parameter (see action=list)")?;
+                        let v = f(a, "value").ok_or("missing `value`")?.clamp(q.min, q.max);
+                        p.set_param(q.id, v);
+                        self.project.dirty = true;
+                    }
+                    "add" => {
+                        let fx = effect()?;
+                        if !crate::dsp::realtime::supports(&fx) {
+                            return Err(format!(
+                                "{} can't run live; use app_apply_effects for it",
+                                fx.name()
+                            ));
+                        }
+                        self.project.add_live_fx(ti, fx);
+                    }
+                    "set" => {
+                        let k = need_slot()?;
+                        let fx = effect()?;
+                        let slot = &mut self.project.tracks[ti].live_fx[k];
+                        if slot.plugin.is_some() {
+                            return Err(format!("slot {k} is a plugin: use action=set_param"));
+                        }
+                        if std::mem::discriminant(&fx) != std::mem::discriminant(&slot.effect) {
+                            return Err(format!("slot {k} is {}, not {}", slot.name(), fx.name()));
+                        }
+                        slot.effect = fx;
+                        self.project.dirty = true;
+                    }
+                    "enable" | "bypass" => {
+                        let k = need_slot()?;
+                        self.project.push_undo("Toggle Live Effect");
+                        self.project.tracks[ti].live_fx[k].enabled =
+                            s(a, "action") == Some("enable");
+                    }
+                    "remove" => {
+                        let k = need_slot()?;
+                        self.project.push_undo("Remove Live Effect");
+                        self.project.tracks[ti].live_fx.remove(k);
+                    }
+                    "apply" => {
+                        self.require_idle()?;
+                        self.engine.stop_playback();
+                        if !self.project.render_live_fx(ti) {
+                            return Err("no enabled live effects on that track".into());
+                        }
+                    }
+                    o => return Err(format!("unknown action {o}")),
+                }
+                let slots = self.project.tracks[ti].live_fx.clone();
+                let mut list: Vec<Value> = Vec::new();
+                for (k, f) in slots.iter().enumerate() {
+                    match &f.plugin {
+                        Some(pl) => {
+                            let mut params = Vec::new();
+                            if let Some(p) = self.plugins.loaded.get_mut(&f.id) {
+                                for q in p.params().iter().filter(|q| !q.is_bypass) {
+                                    let text = p.param_text(q.id, q.value).unwrap_or_default();
+                                    params.push(json!({ "id": q.id, "name": q.name, "value": q.value, "min": q.min, "max": q.max, "display": text }));
+                                }
+                            }
+                            let error = self.plugins.failed.get(&f.id).cloned();
+                            list.push(json!({ "slot": k, "name": f.name(), "enabled": f.enabled,
+                                "plugin": { "format": pl.desc.format.label(), "vendor": pl.desc.vendor, "params": params, "error": error } }));
+                        }
+                        None => list.push(json!({ "slot": k, "name": f.name(), "enabled": f.enabled, "effect": f.effect })),
+                    }
+                }
+                Ok(json!({ "track": ti, "live_fx": list }))
+            }
+            "clips" => {
+                let action = s(a, "action").unwrap_or("list");
+                let track = a.get("track").and_then(Value::as_u64).map(|x| x as usize);
+                let clip = a.get("clip").and_then(Value::as_u64).map(|x| x as usize);
+                let need = |what: Option<usize>, name: &str| {
+                    what.ok_or(format!("missing `{name}` (see action=list)"))
+                };
+                let check = |p: &Project, ti: usize, ci: usize| -> Result<(), String> {
+                    let t = p.tracks.get(ti).ok_or(format!("no track {ti}"))?;
+                    t.clips
+                        .get(ci)
+                        .map(|_| ())
+                        .ok_or(format!("track {ti} has no clip {ci}"))
+                };
+                match action {
+                    "list" => {}
+                    "move" => {
+                        self.require_idle()?;
+                        let (ti, ci) = (need(track, "track")?, need(clip, "clip")?);
+                        check(&self.project, ti, ci)?;
+                        let c = self.project.tracks[ti].clips[ci].clone();
+                        let to = match (f(a, "to"), f(a, "by")) {
+                            (Some(t), _) => self.to_samples(t) as i64,
+                            (None, Some(by)) => {
+                                c.start as i64 + (by * self.project.rate as f64).round() as i64
+                            }
+                            _ => {
+                                return Err(
+                                    "give `to` (new start, seconds) or `by` (seconds)".into()
+                                );
+                            }
+                        };
+                        let dest = a
+                            .get("to_track")
+                            .and_then(Value::as_u64)
+                            .map(|x| x as usize);
+                        if let Some(d) = dest
+                            && d >= self.project.tracks.len()
+                        {
+                            return Err(format!("no track {d}"));
+                        }
+                        self.engine.stop_playback();
+                        if !self.project.move_clip(ti, ci, to - c.start as i64, dest) {
+                            return Err("nothing moved: there is no room there without overlapping another clip \
+                                        (clips stop next to each other). Move or delete the other clip first, or pick a gap that fits."
+                                .into());
+                        }
+                    }
+                    "rename" => {
+                        let (ti, ci) = (need(track, "track")?, need(clip, "clip")?);
+                        check(&self.project, ti, ci)?;
+                        self.project
+                            .rename_clip(ti, ci, s(a, "name").ok_or("missing `name`")?);
+                    }
+                    "delete" => {
+                        self.require_idle()?;
+                        let (ti, ci) = (need(track, "track")?, need(clip, "clip")?);
+                        check(&self.project, ti, ci)?;
+                        self.engine.stop_playback();
+                        self.project.delete_clip(ti, ci);
+                    }
+                    "split" | "join" => {
+                        self.require_idle()?;
+                        if let Some(at) = f(a, "at") {
+                            self.project.selection = Selection::cursor(self.to_samples(at));
+                        }
+                        if let Some(ti) = track {
+                            for (j, t) in self.project.tracks.iter_mut().enumerate() {
+                                t.selected = j == ti;
+                            }
+                        }
+                        let ok = if action == "split" {
+                            self.project.split_clips()
+                        } else {
+                            self.project.join_clips()
+                        };
+                        if !ok {
+                            return Err(format!("nothing to {action} at the cursor/selection"));
+                        }
+                    }
+                    o => return Err(format!("unknown action {o}")),
+                }
+                let r = self.project.rate;
+                let list: Vec<Value> = self
+                    .project
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| json!({ "track": i, "name": t.name, "clips": clips_json(r, t) }))
+                    .collect();
+                Ok(json!({ "tracks": list }))
             }
             "labels" => {
                 let action = s(a, "action").unwrap_or("list");

@@ -12,14 +12,31 @@ mod waveform;
 
 // The audio engine lives in the library crate so the MCP server can share it.
 use rust_audacity::{
-    batch, bridge, dsp, effects, envelope, fileio, labels, mcp, metadata, project, projectfile,
-    track, transcript, whisper,
+    batch, bridge, dsp, effects, envelope, fileio, labels, mcp, metadata, ollama, plugins, project,
+    projectfile, recovery, track, transcript, whisper,
 };
 
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    // Plugin scanning runs in a child process so a crashing plugin can't take the app down.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--scan-plugin") {
+        let path = PathBuf::from(args.get(2).cloned().unwrap_or_default());
+        match plugins::scan_file(&path) {
+            Ok(list) => println!(
+                "{}",
+                serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())
+            ),
+            Err(e) => {
+                eprintln!("{e:#}");
+                println!("[]");
+            }
+        }
+        // Skip plugin library teardown, which some plugins get wrong.
+        std::process::exit(0);
+    }
+    let files: Vec<PathBuf> = args.into_iter().skip(1).map(PathBuf::from).collect();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Rust Audacity")

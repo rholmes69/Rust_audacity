@@ -858,6 +858,8 @@ impl JobResult {
                 let (old_len, new_len) = (p.tracks[idx].len(), t.len());
                 // Keep live UI state (mute/solo/gain/selection/height) as it is now.
                 p.tracks[idx].channels = t.channels;
+                p.tracks[idx].clips = t.clips;
+                p.tracks[idx].envelope = t.envelope;
                 if self.changes_length && new_len != old_len {
                     let e = self.end.min(old_len);
                     let ne = (e as i64 + new_len as i64 - old_len as i64).max(self.start as i64);

@@ -32,7 +32,7 @@ pub struct McpState {
     require_token: bool,
     token: String,
     /// Folder the file tools may use (None = any folder).
-    root: Option<PathBuf>,
+    pub root: Option<PathBuf>,
     server: Option<HttpServer>,
     core: Option<Arc<Server>>,
     /// Settings the running server was started with (restart when they change).

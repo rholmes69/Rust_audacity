@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     envelope::{EnvPoint, Envelope},
     project::{Project, Selection},
-    track::{Track, TrackView},
+    track::{Clip, Track, TrackView},
     transcript::{Transcript, Word},
 };
 
@@ -72,6 +72,11 @@ struct TrackHeader {
     /// Volume envelope points as (sample, dB).
     #[serde(default)]
     envelope: Vec<(usize, f32)>,
+    /// Clips (older projects: one clip for the whole track).
+    #[serde(default)]
+    clips: Option<Vec<Clip>>,
+    #[serde(default)]
+    live_fx: Vec<crate::dsp::realtime::LiveFx>,
 }
 
 /// Horizontal view saved with a project.
@@ -102,6 +107,8 @@ pub fn save(path: &Path, project: &Project, view: Option<ViewState>) -> Result<(
                 height: t.height,
                 spectrogram: t.view == TrackView::Spectrogram,
                 envelope: t.envelope.points.iter().map(|p| (p.pos, p.db)).collect(),
+                clips: Some(t.clips.clone()),
+                live_fx: t.live_fx.clone(),
             })
             .collect(),
         view,
@@ -229,6 +236,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
                 .map(|&(pos, db)| EnvPoint { pos, db })
                 .collect(),
         );
+        t.live_fx = th.live_fx;
+        if let Some(clips) = th.clips {
+            t.clips = clips;
+            t.normalize_clips();
+        }
         t.view = if th.spectrogram {
             TrackView::Spectrogram
         } else {
@@ -252,6 +264,13 @@ pub fn load(path: &Path) -> Result<Loaded> {
     crate::labels::sort(&mut project.labels);
     // Label ids must not collide with ids handed out later.
     project.ensure_ids_above(project.labels.iter().map(|l| l.id).max().unwrap_or(0));
+    let max_fx = project
+        .tracks
+        .iter()
+        .flat_map(|t| t.live_fx.iter().map(|f| f.id))
+        .max()
+        .unwrap_or(0);
+    project.ensure_ids_above(max_fx);
     project.dirty = false;
     Ok(Loaded {
         project,
@@ -290,6 +309,28 @@ mod tests {
         p.tracks[1].view = TrackView::Spectrogram;
         p.tracks[0].envelope = Envelope::from_points(vec![EnvPoint { pos: 7, db: -6.5 }]);
         p.selection = Selection::new(100, 900);
+        p.tracks[0].split_clip_at(2000);
+        p.tracks[0].clips[1].name = "Chorus".into();
+        let mut fx = crate::dsp::realtime::LiveFx::builtin(
+            900,
+            crate::effects::Effect::Amplify { db: -6.0 },
+        );
+        fx.enabled = false;
+        p.tracks[1].live_fx.push(fx);
+        let mut pl = crate::dsp::realtime::LiveFx::plugin(
+            901,
+            crate::plugins::PluginDesc {
+                format: crate::plugins::PluginFormat::Clap,
+                path: "/x/y.clap".into(),
+                id: "com.example.verb".into(),
+                name: "Verb".into(),
+                vendor: "Ex".into(),
+                category: "audio-effect".into(),
+                is_instrument: false,
+            },
+        );
+        pl.plugin.as_mut().unwrap().state = vec![0, 1, 2, 250, 255];
+        p.tracks[1].live_fx.push(pl);
         let view = ViewState {
             left: 12.5,
             samples_per_pixel: 64.0,
@@ -326,6 +367,12 @@ mod tests {
         assert_eq!(q.tracks[1].view, TrackView::Spectrogram);
         assert_eq!(q.tracks[1].len(), 1234);
         assert_eq!(q.labels, p.labels);
+        assert_eq!(q.tracks[0].clips, p.tracks[0].clips);
+        assert_eq!(q.tracks[0].clips[1].name, "Chorus");
+        assert_eq!(q.tracks[1].live_fx, p.tracks[1].live_fx);
+        let mut q2 = q;
+        assert!(q2.alloc_id() > 901);
+        let q = q2;
         assert_eq!(q.metadata.title, "My Song");
         let tr = q.transcript.as_ref().unwrap();
         assert_eq!(tr.track_id, q.tracks[1].id);

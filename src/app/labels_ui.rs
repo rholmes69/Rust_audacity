@@ -90,13 +90,13 @@ impl AudacityApp {
             Sense::click_and_drag(),
         );
         let p = ui.painter_at(strip);
-        p.rect_filled(strip, CornerRadius::ZERO, Color32::from_gray(30));
+        p.rect_filled(strip, CornerRadius::ZERO, self.pal.strip_bg);
         p.line_segment(
             [
                 pos2(strip.left(), strip.bottom() - 0.5),
                 pos2(strip.right(), strip.bottom() - 0.5),
             ],
-            Stroke::new(1.0, Color32::from_gray(50)),
+            Stroke::new(1.0, self.pal.strip_sep),
         );
         let mut hits: Vec<(u64, Rect, f32, f32, bool)> = Vec::new();
         for l in &self.project.labels {
@@ -158,7 +158,7 @@ impl AudacityApp {
                 Align2::LEFT_CENTER,
                 "Labels",
                 FontId::proportional(11.0),
-                Color32::from_gray(110),
+                self.pal.weak_text,
             );
         }
 

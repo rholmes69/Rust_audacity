@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Color32, CornerRadius, Rect, RichText, Sense, Stroke, pos2, vec2};
 
-use super::AudacityApp;
+use super::{AudacityApp, recovery_ui};
 use crate::{
     effects::{Generator, Waveform, lin_to_db},
     engine::{self, DeviceSettings},
@@ -20,9 +20,19 @@ const BUFFERS: [Option<u32>; 7] = [
     Some(2048),
 ];
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PrefsTab {
+    #[default]
+    Audio,
+    Projects,
+    Appearance,
+    Keyboard,
+}
+
 #[derive(Default)]
 pub struct PrefsState {
     pub open: bool,
+    pub tab: PrefsTab,
     outputs: Vec<String>,
     inputs: Vec<String>,
     /// Smoothed input level for the monitor meter.
@@ -75,8 +85,32 @@ impl AudacityApp {
             .default_width(460.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.heading("Audio");
-                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for (t, label) in [
+                        (PrefsTab::Audio, "Audio"),
+                        (PrefsTab::Projects, "Projects"),
+                        (PrefsTab::Appearance, "Appearance"),
+                        (PrefsTab::Keyboard, "Keyboard"),
+                    ] {
+                        ui.selectable_value(&mut self.prefs.tab, t, label);
+                    }
+                });
+                ui.separator();
+                match self.prefs.tab {
+                    PrefsTab::Projects => {
+                        self.prefs_projects(ui);
+                        return;
+                    }
+                    PrefsTab::Appearance => {
+                        self.prefs_appearance(ui);
+                        return;
+                    }
+                    PrefsTab::Keyboard => {
+                        self.prefs_keyboard(ui);
+                        return;
+                    }
+                    PrefsTab::Audio => {}
+                }
                 let d = &mut self.engine.devices;
                 egui::Grid::new("prefs_audio").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     let device_combo = |ui: &mut egui::Ui, id: &str, value: &mut Option<String>, list: &[String]| {
@@ -122,6 +156,7 @@ impl AudacityApp {
                         .on_hover_text("Smaller = lower latency when recording, but more risk of crackles. 256–512 suits most computers.");
                     ui.end_row();
                 });
+
                 ui.horizontal(|ui| {
                     if ui.button("⟳ Refresh devices").clicked() {
                         refresh = true;
@@ -202,6 +237,7 @@ impl AudacityApp {
         }
         if self.engine.devices != before {
             self.engine.device_warning = None;
+            self.plugins_follow_device_rate();
             // Re-open the monitor on the newly chosen input.
             if self.engine.is_monitoring() {
                 self.engine.stop_recording();
@@ -240,6 +276,125 @@ impl AudacityApp {
             if self.engine.is_monitoring() {
                 self.engine.stop_recording();
             }
+        }
+    }
+}
+
+impl AudacityApp {
+    fn prefs_projects(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Autosave for crash recovery:");
+            let r = &mut self.recovery;
+            egui::ComboBox::from_id_salt("autosave")
+                .selected_text(recovery_ui::interval_label(r.interval_secs))
+                .show_ui(ui, |ui| {
+                    for s in recovery_ui::INTERVALS {
+                        ui.selectable_value(&mut r.interval_secs, s, recovery_ui::interval_label(s));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Unsaved changes are saved to a recovery file in the background. If the app crashes, \
+                     you're offered to recover them next time.",
+                );
+        });
+        ui.label(
+            RichText::new(format!(
+                "Recovery files: {}",
+                crate::recovery::recovery_dir().display()
+            ))
+            .small()
+            .weak(),
+        );
+        if let Some(e) = &self.recovery.error {
+            ui.colored_label(Color32::from_rgb(230, 170, 80), e);
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(format!("Recent files: {}", self.recovery.recent.0.len()));
+            if ui.button("Clear").clicked() {
+                self.recovery.recent.0.clear();
+            }
+        });
+    }
+
+    fn prefs_appearance(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Theme:");
+            let before = self.theme;
+            for t in super::theme::ThemeChoice::ALL {
+                ui.radio_value(&mut self.theme, t, t.label());
+            }
+            if self.theme != before {
+                self.theme.apply(ui.ctx());
+            }
+        });
+        ui.label(
+            RichText::new("“Same as system” follows your computer's light/dark setting.")
+                .small()
+                .weak(),
+        );
+    }
+
+    fn prefs_keyboard(&mut self, ui: &mut egui::Ui) {
+        use super::keys::Keymap;
+        ui.label(
+            RichText::new("Click Change, then press the new key combination (Esc cancels).")
+                .small()
+                .weak(),
+        );
+        if let Some(n) = &self.keys.note {
+            ui.colored_label(Color32::from_rgb(230, 170, 80), n);
+        }
+        egui::ScrollArea::vertical()
+            .max_height(380.0)
+            .show(ui, |ui| {
+                egui::Grid::new("keys")
+                    .striped(true)
+                    .num_columns(3)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        for (act, label) in Keymap::commands() {
+                            ui.label(label);
+                            let text = if self.keys.capturing == Some(act) {
+                                RichText::new("Press keys…")
+                                    .italics()
+                                    .color(Color32::from_rgb(255, 210, 90))
+                            } else {
+                                let t = self.keys.labels(act);
+                                RichText::new(if t.is_empty() { "—".to_string() } else { t })
+                                    .monospace()
+                            };
+                            ui.label(text);
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Change").clicked() {
+                                    self.keys.capturing = Some(act);
+                                    self.keys.note = None;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.keys.is_default(act),
+                                        egui::Button::new("Reset").small(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.keys.reset(act);
+                                }
+                                if ui
+                                    .small_button("None")
+                                    .on_hover_text("No key for this command")
+                                    .clicked()
+                                {
+                                    self.keys.clear(act);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+        ui.separator();
+        if ui.button("Reset all to defaults").clicked() {
+            self.keys.reset_all();
         }
     }
 }

@@ -15,7 +15,7 @@ This produces `target\release\rust_audacity_mcp.exe`. Running `cargo build --rel
 
 ## Built into the app (HTTP), the easiest way
 
-While Rust Audacity is open, it serves the same 25 tools over **Streamable HTTP** at
+While Rust Audacity is open, it serves the same 28 tools over **Streamable HTTP** at
 
 ```
 http://127.0.0.1:8765/mcp
@@ -122,6 +122,9 @@ These tools need the Rust Audacity app to be running (Agents ▸ "Allow AI agent
 | `app_save_project` | Save as `.rap`. |
 | `app_transcript` | `transcribe` (Whisper), `get` (words with indices and times), `delete_words` (cut words by index), `remove_fillers`, `show`. |
 | `app_labels` | `list`, `add` (point or region, seconds), `rename`, `delete`, `clear`, `export_files` (one audio file per label into a folder). Labels become chapters on export. |
+| `app_clips` | `list` clips per track, `split` (at a time or the selection), `join`, `move` a clip (`to`/`by` seconds, optionally `to_track`; it stops next to other clips), `rename`, `delete`. |
+| `app_live_fx` | Live (non-destructive) effect racks: `list`, `add` a built-in `effect` or an installed VST3/CLAP `plugin` by name, `set` settings, `set_param` (plugin parameter by name/id), `enable`/`bypass`, `remove`, `apply` (bake into the audio). |
+| `app_spectral_edit` | Edit a time × frequency box: `delete`, `reduce` (`db`), `heal` (fill from the surroundings), `isolate`. |
 | `app_metadata` | Set title, artist, album, album artist, year, genre, track, comment and cover art (`cover_path`, or `remove_cover`). Written into every export. |
 
 Inputs are never modified: results go to a new file (default `<name>_processed.wav` and similar). Writing over the input requires `overwrite: true`.

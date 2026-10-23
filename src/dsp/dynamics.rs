@@ -25,7 +25,99 @@ fn linked_peak(chans: &[Vec<f32>], i: usize) -> f32 {
     chans.iter().fold(0f32, |m, c| m.max(c[i].abs()))
 }
 
-/// Feed-forward compressor with a soft knee.
+/// Feed-forward compressor with a soft knee. Keeps its state between blocks, so it can run
+/// on a live stream as well as on a whole file.
+#[derive(Clone, Debug)]
+pub struct Compressor {
+    att: f32,
+    rel: f32,
+    threshold_db: f32,
+    ratio: f32,
+    knee_db: f32,
+    makeup: f32,
+    env_db: f32,
+}
+
+impl Compressor {
+    pub fn new(
+        rate: f32,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        knee_db: f32,
+        makeup_db: f32,
+    ) -> Self {
+        let mut c = Self {
+            att: 0.0,
+            rel: 0.0,
+            threshold_db: 0.0,
+            ratio: 1.0,
+            knee_db: 0.0,
+            makeup: 1.0,
+            env_db: -120.0,
+        };
+        c.set(
+            rate,
+            threshold_db,
+            ratio,
+            attack_ms,
+            release_ms,
+            knee_db,
+            makeup_db,
+        );
+        c
+    }
+
+    /// Change the settings without resetting the envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set(
+        &mut self,
+        rate: f32,
+        threshold_db: f32,
+        ratio: f32,
+        attack_ms: f32,
+        release_ms: f32,
+        knee_db: f32,
+        makeup_db: f32,
+    ) {
+        self.att = coef(attack_ms, rate);
+        self.rel = coef(release_ms, rate);
+        self.threshold_db = threshold_db;
+        self.ratio = ratio.max(1.0);
+        self.knee_db = knee_db;
+        self.makeup = lin(makeup_db);
+    }
+
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        let len = chans.first().map_or(0, Vec::len);
+        let (knee, ratio) = (self.knee_db, self.ratio);
+        for i in 0..len {
+            let level = db(linked_peak(chans, i));
+            let c = if level > self.env_db {
+                self.att
+            } else {
+                self.rel
+            };
+            self.env_db = level + c * (self.env_db - level);
+            // Gain computer with soft knee.
+            let over = self.env_db - self.threshold_db;
+            let gr = if 2.0 * over < -knee {
+                0.0
+            } else if knee > 0.0 && 2.0 * over.abs() <= knee {
+                (1.0 / ratio - 1.0) * (over + knee / 2.0).powi(2) / (2.0 * knee)
+            } else {
+                (1.0 / ratio - 1.0) * over
+            };
+            let g = lin(gr) * self.makeup;
+            for ch in chans.iter_mut() {
+                ch[i] *= g;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn compress(
     chans: &mut [Vec<f32>],
     rate: f32,
@@ -36,31 +128,16 @@ pub fn compress(
     knee_db: f32,
     makeup_db: f32,
 ) {
-    let Some(len) = chans.first().map(Vec::len) else {
-        return;
-    };
-    let (att, rel) = (coef(attack_ms, rate), coef(release_ms, rate));
-    let ratio = ratio.max(1.0);
-    let makeup = lin(makeup_db);
-    let mut env_db = -120f32;
-    for i in 0..len {
-        let level = db(linked_peak(chans, i));
-        let c = if level > env_db { att } else { rel };
-        env_db = level + c * (env_db - level);
-        // Gain computer with soft knee.
-        let over = env_db - threshold_db;
-        let gr = if 2.0 * over < -knee_db {
-            0.0
-        } else if knee_db > 0.0 && 2.0 * over.abs() <= knee_db {
-            (1.0 / ratio - 1.0) * (over + knee_db / 2.0).powi(2) / (2.0 * knee_db)
-        } else {
-            (1.0 / ratio - 1.0) * over
-        };
-        let g = lin(gr) * makeup;
-        for ch in chans.iter_mut() {
-            ch[i] *= g;
-        }
-    }
+    Compressor::new(
+        rate,
+        threshold_db,
+        ratio,
+        attack_ms,
+        release_ms,
+        knee_db,
+        makeup_db,
+    )
+    .process(chans);
 }
 
 /// Brick-wall look-ahead limiter: guarantees no sample exceeds `ceiling_db`.
@@ -112,7 +189,132 @@ pub fn limit(chans: &mut [Vec<f32>], rate: f32, ceiling_db: f32, release_ms: f32
     }
 }
 
+/// Peak limiter for live playback: instant attack (no look-ahead, so no delay), smooth
+/// release, and a final clamp so nothing ever exceeds the ceiling.
+#[derive(Clone, Debug)]
+pub struct LiveLimiter {
+    ceiling: f32,
+    rel: f32,
+    g: f32,
+}
+
+impl LiveLimiter {
+    pub fn new(rate: f32, ceiling_db: f32, release_ms: f32) -> Self {
+        Self {
+            ceiling: lin(ceiling_db),
+            rel: coef(release_ms, rate),
+            g: 1.0,
+        }
+    }
+    pub fn set(&mut self, rate: f32, ceiling_db: f32, release_ms: f32) {
+        self.ceiling = lin(ceiling_db);
+        self.rel = coef(release_ms, rate);
+    }
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        let len = chans.first().map_or(0, Vec::len);
+        for i in 0..len {
+            let target = (self.ceiling / linked_peak(chans, i).max(1e-9)).min(1.0);
+            self.g = if target < self.g {
+                target
+            } else {
+                target + self.rel * (self.g - target)
+            };
+            for ch in chans.iter_mut() {
+                ch[i] = (ch[i] * self.g).clamp(-self.ceiling, self.ceiling);
+            }
+        }
+    }
+}
+
 /// Noise gate: turns audio down by `reduction_db` when it falls below `threshold_db`.
+#[derive(Clone, Debug)]
+pub struct Gate {
+    thr: f32,
+    floor: f32,
+    env_rel: f32,
+    att: f32,
+    rel: f32,
+    hold: usize,
+    env: f32,
+    held: usize,
+    g: f32,
+}
+
+impl Gate {
+    pub fn new(
+        rate: f32,
+        threshold_db: f32,
+        reduction_db: f32,
+        attack_ms: f32,
+        hold_ms: f32,
+        release_ms: f32,
+    ) -> Self {
+        let mut g = Self {
+            thr: 0.0,
+            floor: 0.0,
+            env_rel: 0.0,
+            att: 0.0,
+            rel: 0.0,
+            hold: 0,
+            env: 0.0,
+            held: 0,
+            g: 0.0,
+        };
+        g.set(
+            rate,
+            threshold_db,
+            reduction_db,
+            attack_ms,
+            hold_ms,
+            release_ms,
+        );
+        g.g = g.floor;
+        g
+    }
+    pub fn set(
+        &mut self,
+        rate: f32,
+        threshold_db: f32,
+        reduction_db: f32,
+        attack_ms: f32,
+        hold_ms: f32,
+        release_ms: f32,
+    ) {
+        self.thr = lin(threshold_db);
+        self.floor = lin(-reduction_db.abs());
+        self.env_rel = coef(20.0, rate);
+        self.att = coef(attack_ms, rate);
+        self.rel = coef(release_ms, rate);
+        self.hold = (hold_ms * 0.001 * rate) as usize;
+    }
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        let len = chans.first().map_or(0, Vec::len);
+        for i in 0..len {
+            let p = linked_peak(chans, i);
+            self.env = if p > self.env {
+                p
+            } else {
+                p + self.env_rel * (self.env - p)
+            };
+            let open = if self.env >= self.thr {
+                self.held = self.hold;
+                true
+            } else if self.held > 0 {
+                self.held -= 1;
+                true
+            } else {
+                false
+            };
+            let target = if open { 1.0 } else { self.floor };
+            let c = if target > self.g { self.att } else { self.rel };
+            self.g = target + c * (self.g - target);
+            for ch in chans.iter_mut() {
+                ch[i] *= self.g;
+            }
+        }
+    }
+}
+
 pub fn gate(
     chans: &mut [Vec<f32>],
     rate: f32,
@@ -122,40 +324,107 @@ pub fn gate(
     hold_ms: f32,
     release_ms: f32,
 ) {
-    let Some(len) = chans.first().map(Vec::len) else {
-        return;
-    };
-    let thr = lin(threshold_db);
-    let floor = lin(-reduction_db.abs());
-    let env_rel = coef(20.0, rate);
-    let (att, rel) = (coef(attack_ms, rate), coef(release_ms, rate));
-    let hold = (hold_ms * 0.001 * rate) as usize;
-    let mut env = 0f32;
-    let mut held = 0usize;
-    let mut g = floor;
-    for i in 0..len {
-        let p = linked_peak(chans, i);
-        env = if p > env { p } else { p + env_rel * (env - p) };
-        let open = if env >= thr {
-            held = hold;
-            true
-        } else if held > 0 {
-            held -= 1;
-            true
-        } else {
-            false
-        };
-        let target = if open { 1.0 } else { floor };
-        let c = if target > g { att } else { rel };
-        g = target + c * (g - target);
-        for ch in chans.iter_mut() {
-            ch[i] *= g;
-        }
-    }
+    Gate::new(
+        rate,
+        threshold_db,
+        reduction_db,
+        attack_ms,
+        hold_ms,
+        release_ms,
+    )
+    .process(chans);
 }
 
 /// Split-band de-esser: reduces only the high band (above ~`freq_hz`) while
 /// sibilance in that band exceeds `threshold_db`.
+#[derive(Clone, Debug)]
+pub struct DeEsser {
+    det: Vec<Biquad>,
+    split: Vec<[Biquad; 2]>,
+    thr: f32,
+    att: f32,
+    rel: f32,
+    floor: f32,
+    env: f32,
+}
+
+impl DeEsser {
+    pub fn new(
+        rate: f32,
+        channels: usize,
+        threshold_db: f32,
+        freq_hz: f32,
+        max_reduction_db: f32,
+    ) -> Self {
+        let mut d = Self {
+            det: Vec::new(),
+            split: Vec::new(),
+            thr: 0.0,
+            att: 0.0,
+            rel: 0.0,
+            floor: 0.0,
+            env: 0.0,
+        };
+        d.set(rate, channels, threshold_db, freq_hz, max_reduction_db);
+        d
+    }
+    pub fn set(
+        &mut self,
+        rate: f32,
+        channels: usize,
+        threshold_db: f32,
+        freq_hz: f32,
+        max_reduction_db: f32,
+    ) {
+        // Detector: band-pass around the sibilance band, stereo-linked.
+        let det: Vec<Biquad> = (0..channels)
+            .map(|_| Biquad::bandpass(freq_hz * 1.4, 1.0, rate))
+            .collect();
+        // Complementary split: y = g·x + (1−g)·LP(x). With g = 1 the signal is untouched;
+        // as g drops, only content above the (4th-order) low-pass is turned down.
+        let split: Vec<[Biquad; 2]> = (0..channels)
+            .map(|_| [Biquad::lowpass(freq_hz * 0.7, BUTTERWORTH_Q, rate); 2])
+            .collect();
+        if self.det.len() == channels {
+            for (n, o) in self.det.iter_mut().zip(det) {
+                n.set_coefficients(&o);
+            }
+            for (n, o) in self.split.iter_mut().zip(split) {
+                n[0].set_coefficients(&o[0]);
+                n[1].set_coefficients(&o[1]);
+            }
+        } else {
+            self.det = det;
+            self.split = split;
+        }
+        self.thr = lin(threshold_db);
+        self.att = coef(1.0, rate);
+        self.rel = coef(60.0, rate);
+        self.floor = lin(-max_reduction_db.abs());
+    }
+    pub fn process(&mut self, chans: &mut [Vec<f32>]) {
+        let len = chans.first().map_or(0, Vec::len);
+        for i in 0..len {
+            let mut p = 0f32;
+            for (c, d) in chans.iter().zip(self.det.iter_mut()) {
+                p = p.max(d.tick(c[i]).abs());
+            }
+            let co = if p > self.env { self.att } else { self.rel };
+            self.env = p + co * (self.env - p);
+            let g = if self.env > self.thr {
+                (self.thr / self.env).max(self.floor)
+            } else {
+                1.0
+            };
+            for (c, s) in chans.iter_mut().zip(self.split.iter_mut()) {
+                let stage1 = s[0].tick(c[i]);
+                let low = s[1].tick(stage1);
+                c[i] = g * c[i] + (1.0 - g) * low;
+            }
+        }
+    }
+}
+
 pub fn de_ess(
     chans: &mut [Vec<f32>],
     rate: f32,
@@ -163,42 +432,7 @@ pub fn de_ess(
     freq_hz: f32,
     max_reduction_db: f32,
 ) {
-    let Some(len) = chans.first().map(Vec::len) else {
-        return;
-    };
-    // Detector: band-pass around the sibilance band, stereo-linked.
-    let mut det: Vec<Biquad> = chans
-        .iter()
-        .map(|_| Biquad::bandpass(freq_hz * 1.4, 1.0, rate))
-        .collect();
-    // Complementary split: y = g·x + (1−g)·LP(x). With g = 1 the signal is untouched;
-    // as g drops, only content above the (4th-order) low-pass is turned down.
-    let mut split: Vec<[Biquad; 2]> = chans
-        .iter()
-        .map(|_| [Biquad::lowpass(freq_hz * 0.7, BUTTERWORTH_Q, rate); 2])
-        .collect();
-    let thr = lin(threshold_db);
-    let (att, rel) = (coef(1.0, rate), coef(60.0, rate));
-    let floor = lin(-max_reduction_db.abs());
-    let mut env = 0f32;
-    for i in 0..len {
-        let mut p = 0f32;
-        for (c, d) in chans.iter().zip(det.iter_mut()) {
-            p = p.max(d.tick(c[i]).abs());
-        }
-        let co = if p > env { att } else { rel };
-        env = p + co * (env - p);
-        let g = if env > thr {
-            (thr / env).max(floor)
-        } else {
-            1.0
-        };
-        for (c, s) in chans.iter_mut().zip(split.iter_mut()) {
-            let stage1 = s[0].tick(c[i]);
-            let low = s[1].tick(stage1);
-            c[i] = g * c[i] + (1.0 - g) * low;
-        }
-    }
+    DeEsser::new(rate, chans.len(), threshold_db, freq_hz, max_reduction_db).process(chans);
 }
 
 #[cfg(test)]

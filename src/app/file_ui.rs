@@ -79,6 +79,7 @@ impl AudacityApp {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Project".into());
                 self.project_path = Some(path.to_path_buf());
+                self.add_recent(path);
                 match loaded.view {
                     Some(v) if v.samples_per_pixel > 0.0 => {
                         self.view = View {
@@ -103,6 +104,7 @@ impl AudacityApp {
         if self.busy() {
             return false;
         }
+        self.capture_plugin_states();
         let path = match (&self.project_path, save_as) {
             (Some(p), false) => p.clone(),
             _ => {
@@ -127,6 +129,7 @@ impl AudacityApp {
             Ok(()) => {
                 self.project.dirty = false;
                 self.project_path = Some(path.clone());
+                self.add_recent(&path);
                 self.title = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())

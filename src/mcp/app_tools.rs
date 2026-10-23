@@ -15,8 +15,11 @@ use super::{
     tools::{Output, R, b, f, input_path, norm, output_path, parse_effect, req_str, s},
 };
 
-pub const NAMES: [&str; 13] = [
+pub const NAMES: [&str; 16] = [
     "app_labels",
+    "app_clips",
+    "app_live_fx",
+    "app_spectral_edit",
     "app_metadata",
     "app_auto_duck",
     "app_status",
@@ -172,6 +175,69 @@ pub fn definitions() -> Vec<Value> {
             false,
         ),
         tool(
+            "app_clips",
+            "Rust Audacity window: clips",
+            "Clips are separately movable pieces of audio on a track, with silent gaps between them. action=list shows every \
+             track's clips (index, name, start, end). split cuts clips at `at` seconds (or the cursor / both ends of the selection), \
+             optionally only on `track`; join merges the clips the selection touches; move a clip to a new start time `to` (seconds) \
+             or `by` seconds, optionally onto `to_track` (it stops next to other clips rather than overlapping); rename (`name`); \
+             delete (leaves a gap). Every change is one undo step.",
+            json!({
+                "action": { "type": "string", "enum": ["list", "split", "join", "move", "rename", "delete"] },
+                "track": { "type": "integer", "description": "Track index." },
+                "clip": { "type": "integer", "description": "Clip index on that track (see list)." },
+                "at": secs("split: time to split at."),
+                "to": secs("move: new start time."),
+                "by": secs("move: offset (negative = earlier)."),
+                "to_track": { "type": "integer", "description": "move: destination track index." },
+                "name": { "type": "string", "description": "rename: new name." },
+            }),
+            &["action"],
+            false,
+        ),
+        tool(
+            "app_live_fx",
+            "Rust Audacity window: live effects",
+            "Each track has a rack of live effects that are heard while playing and applied on export, without changing the \
+             audio (non-destructive). Live-capable effects: amplify, invert, echo, low_pass, high_pass, hum_removal, de_esser, \
+             compressor, limiter, noise_gate, graphic_eq, bass_treble, distortion, reverb, stereo_widener, vocal_remover \
+             (same effect specs as app_apply_effects). Installed VST3/CLAP plugins can be added too: add with `plugin` (its name, \
+             optionally `format` vst3/clap) instead of `effect`; then set_param (`slot`, `param` name or id, `value` in the range \
+             list shows). action=list shows the rack (with plugin parameters); add appends; set changes a built-in slot's settings \
+             (same effect type); enable / bypass; remove; apply bakes the rack into the audio and empties it.",
+            json!({
+                "action": { "type": "string", "enum": ["list", "add", "set", "set_param", "enable", "bypass", "remove", "apply"] },
+                "plugin": { "type": "string", "description": "add: name of an installed VST3/CLAP plugin." },
+                "format": { "type": "string", "enum": ["vst3", "clap"], "description": "add: prefer this plugin format." },
+                "param": { "description": "set_param: parameter name or id." },
+                "value": { "type": "number", "description": "set_param: new value (within the parameter's min–max)." },
+                "track": { "type": "integer", "description": "Track index (default 0)." },
+                "slot": { "type": "integer", "description": "Position in the rack (see list)." },
+                "effect": { "description": "Effect spec, e.g. \"reverb\" or {\"effect\": \"compressor\", \"params\": {\"threshold_db\": -20}}." },
+            }),
+            &["action"],
+            false,
+        ),
+        tool(
+            "app_spectral_edit",
+            "Rust Audacity window: spectral edit",
+            "Edit only a band of frequencies during a time range, on the selected tracks (or `track`): delete removes it \
+             (a whistle, a beep), reduce turns it down by `db` (default 12), heal replaces it with the surrounding sound \
+             (a cough, a chair squeak, a click), isolate keeps only that band. Use analyze_audio/render_spectrogram to find \
+             the frequencies. One undo step; the box is shown in the app's Spectrum view.",
+            json!({
+                "action": { "type": "string", "enum": ["delete", "reduce", "heal", "isolate"] },
+                "start": secs("Start of the time range."),
+                "end": secs("End of the time range."),
+                "low_hz": { "type": "number", "description": "Lowest frequency in Hz." },
+                "high_hz": { "type": "number", "description": "Highest frequency in Hz." },
+                "db": { "type": "number", "description": "reduce: how much, in dB." },
+                "track": { "type": "integer", "description": "Only this track (default: the selected tracks)." },
+            }),
+            &["action", "start", "end", "low_hz", "high_hz"],
+            false,
+        ),
+        tool(
             "app_metadata",
             "Rust Audacity window: metadata",
             "Get or set the project's metadata (written into exported files): title, artist, album, album_artist, year, genre, \
@@ -303,7 +369,21 @@ fn track_lines(st: &Value) -> String {
                         } else {
                             ""
                         },
-                    )
+                    ) + &{
+                        let clips = t["clips"].as_array().map_or(0, Vec::len);
+                        let fx: Vec<&str> = t["live_fx"]
+                            .as_array()
+                            .map(|v| v.iter().filter_map(|f| f.as_str()).collect())
+                            .unwrap_or_default();
+                        let mut extra = String::new();
+                        if clips > 1 {
+                            extra.push_str(&format!(", {clips} clips"));
+                        }
+                        if !fx.is_empty() {
+                            extra.push_str(&format!(", live FX: {}", fx.join(" → ")));
+                        }
+                        extra
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -505,6 +585,98 @@ pub fn call(name: &str, args: &Value, cfg: &Config, progress: &Progress) -> R<Ou
                 })
                 .collect();
             out(format!("{} label(s):\n{}", list.len(), lines.join("\n")), r)
+        }
+        "app_spectral_edit" => {
+            let r = c.call("spectral", args.clone())?;
+            out(
+                format!(
+                    "{} on {:.3}–{:.3} s, {:.0}–{:.0} Hz (undo with app_edit undo).",
+                    r["applied"].as_str().unwrap_or(""),
+                    r["start"].as_f64().unwrap_or(0.0),
+                    r["end"].as_f64().unwrap_or(0.0),
+                    r["low_hz"].as_f64().unwrap_or(0.0),
+                    r["high_hz"].as_f64().unwrap_or(0.0)
+                ),
+                r,
+            )
+        }
+        "app_live_fx" => {
+            let mut a = args.clone();
+            if let Some(spec) = args.get("effect") {
+                let fx = parse_effect(spec).map_err(|e| format!("effect: {e}"))?;
+                a["effect"] = serde_json::to_value(fx).map_err(|e| e.to_string())?;
+            }
+            let r = c.call("live_fx", a)?;
+            let rack: Vec<String> = r["live_fx"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| {
+                    let mut line = format!(
+                        "  slot {}: {}{}",
+                        f["slot"],
+                        f["name"].as_str().unwrap_or(""),
+                        if f["enabled"].as_bool() == Some(false) {
+                            " (bypassed)"
+                        } else {
+                            ""
+                        }
+                    );
+                    if let Some(pl) = f.get("plugin") {
+                        line.push_str(&format!(
+                            " [{} plugin]",
+                            pl["format"].as_str().unwrap_or("")
+                        ));
+                        if let Some(e) = pl["error"].as_str() {
+                            line.push_str(&format!(" – not loaded: {e}"));
+                        }
+                        for q in pl["params"].as_array().cloned().unwrap_or_default() {
+                            line.push_str(&format!(
+                                "\n      {} “{}” = {} ({}; range {}–{})",
+                                q["id"],
+                                q["name"].as_str().unwrap_or(""),
+                                q["value"],
+                                q["display"].as_str().unwrap_or(""),
+                                q["min"],
+                                q["max"]
+                            ));
+                        }
+                    }
+                    line
+                })
+                .collect();
+            let text = if rack.is_empty() {
+                format!("Track {} has no live effects.", r["track"])
+            } else {
+                format!(
+                    "Live effects on track {} (in order):\n{}",
+                    r["track"],
+                    rack.join("\n")
+                )
+            };
+            out(text, r)
+        }
+        "app_clips" => {
+            let r = c.call("clips", args.clone())?;
+            let mut lines = Vec::new();
+            for t in r["tracks"].as_array().cloned().unwrap_or_default() {
+                lines.push(format!(
+                    "Track {} “{}”:",
+                    t["track"],
+                    t["name"].as_str().unwrap_or("")
+                ));
+                for cl in t["clips"].as_array().cloned().unwrap_or_default() {
+                    lines.push(format!(
+                        "  clip {}: {:.3}–{:.3}s “{}”",
+                        cl["clip"],
+                        cl["start"].as_f64().unwrap_or(0.0),
+                        cl["end"].as_f64().unwrap_or(0.0),
+                        cl["name"].as_str().unwrap_or("")
+                    ));
+                }
+            }
+            out(lines.join("\n"), r)
         }
         "app_metadata" => {
             let mut a = args.clone();

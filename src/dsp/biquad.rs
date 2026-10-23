@@ -120,6 +120,16 @@ impl Biquad {
         )
     }
 
+    /// Take another filter's coefficients but keep this one's state (for changing
+    /// settings while audio is playing, without clicks).
+    pub fn set_coefficients(&mut self, other: &Biquad) {
+        self.b0 = other.b0;
+        self.b1 = other.b1;
+        self.b2 = other.b2;
+        self.a1 = other.a1;
+        self.a2 = other.a2;
+    }
+
     #[inline]
     pub fn tick(&mut self, x0: f32) -> f32 {
         let y0 = self.b0 * x0 + self.b1 * self.x1 + self.b2 * self.x2
